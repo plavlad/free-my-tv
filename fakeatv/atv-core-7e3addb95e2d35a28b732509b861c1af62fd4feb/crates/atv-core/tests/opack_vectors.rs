@@ -36,7 +36,38 @@ fn opack_small_ints() {
 
 #[test]
 fn opack_int_boundaries() {
-    check("int_boundaries", arr(vec![Value::Int(40u64), Value::Int(255u64), Value::Int(256u64), Value::Int(65535u64), Value::Int(65536u64), Value::Int(4294967295u64), Value::Int(4294967296u64), Value::Int(18446744073709551615u64)]), "d8302830ff31000131ffff320000010032ffffffff33000000000100000033ffffffffffffffff");
+    // Apple CoreUtils OPACKDecodeBytes decodes 0x30/0x31/0x32 as signed int8/int16/int32,
+    // so positive values >= 0x80 / 0x8000 / 0x8000_0000 must promote to the next wider width.
+    check(
+        "int_boundaries",
+        arr(vec![
+            Value::Int(40u64),
+            Value::Int(127u64),
+            Value::Int(128u64),
+            Value::Int(255u64),
+            Value::Int(32767u64),
+            Value::Int(32768u64),
+            Value::Int(65535u64),
+            Value::Int(2147483647u64),
+            Value::Int(2147483648u64),
+            Value::Int(4294967295u64),
+            Value::Int(4294967296u64),
+            Value::Int(18446744073709551615u64),
+        ]),
+        "dc3028307f31800031ff0031ff7f320080000032ffff000032ffffff7f33000000800000000033ffffffff0000000033000000000100000033ffffffffffffffff",
+    );
+}
+
+#[test]
+fn opack_high_bit_xid_uses_64bit() {
+    // Regression test for iOS rapportd 30-second Connecting... hang when XID has bit 31 set
+    let xid = 0x986e6123u64;
+    let packed = pack(&Value::Int(xid));
+    assert_eq!(packed[0], 0x33, "high-bit uint32 XID must encode with 0x33 (int64)");
+    assert_eq!(packed.len(), 9);
+    let (unpacked, rem) = unpack(&packed).unwrap();
+    assert!(rem.is_empty());
+    assert_eq!(unpacked, Value::Int(xid));
 }
 
 #[test]

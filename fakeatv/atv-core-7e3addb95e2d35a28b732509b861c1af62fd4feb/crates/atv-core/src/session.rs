@@ -1,9 +1,9 @@
-//! Companion Link session: pairing, verification and the encrypted control
-//! channel. Ported from `fake_atv.py`'s `CompanionSession`.
+//! Companion Link session: pairing, verification, encrypted control channel,
+//! Now Playing OPACK/NSKeyedArchiver updates, and RTI bidirectional keyboard.
 
+use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::io::Cursor;
 
 use ed25519_dalek::{Signer, SigningKey};
 use tokio::io::AsyncWriteExt;
@@ -17,8 +17,11 @@ use crate::delegate::{AtvDelegate, EventKind, TouchPhase, TrackpadMode};
 use crate::error::{Error, Result};
 use crate::identity::DeviceIdentity;
 use crate::inspector::InspectorHub;
+use crate::media::{MediaHub, MediaInfo};
 use crate::opack::{self, Value};
 use crate::registry::{ActiveConnectionTracker, DeviceRegistry};
+use crate::rti::{self, RtiTextOperation};
+use crate::server::{KeyboardFocusEvent, SOURCE_VERSION};
 use crate::srp::SrpServer;
 use crate::tlv::{self, tags};
 use crate::FrameType;
@@ -66,84 +69,90 @@ fn hid_command_name(command: u64) -> String {
     }
 }
 
-fn resolve_plist_uid<'a>(objects: &'a [plist::Value], value: &'a plist::Value) -> Option<&'a plist::Value> {
-        match value {
-            plist::Value::Uid(uid) => objects.get(uid.get() as usize),
-            _ => Some(value),
+fn resolve_plist_uid<'a>(
+    objects: &'a [plist::Value],
+    value: &'a plist::Value,
+) -> Option<&'a plist::Value> {
+    match value {
+        plist::Value::Uid(uid) => objects.get(uid.get() as usize),
+        _ => Some(value),
+    }
+}
+
+fn extract_text_from_keyed_archive(data: &[u8]) -> Option<String> {
+    let root = plist::Value::from_reader(Cursor::new(data)).ok()?;
+    let dict = root.as_dictionary()?;
+    let objects = dict.get("$objects")?.as_array()?;
+    let top = dict.get("$top")?.as_dictionary()?;
+    let text_ops = resolve_plist_uid(objects, top.get("textOperations")?)?.as_dictionary()?;
+    let keyboard_output =
+        resolve_plist_uid(objects, text_ops.get("keyboardOutput")?)?.as_dictionary()?;
+    let insertion = resolve_plist_uid(objects, keyboard_output.get("insertionText")?)?.as_string()?;
+    if insertion.is_empty() {
+        None
+    } else {
+        Some(insertion.to_string())
+    }
+}
+
+fn collect_text_payloads(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Bytes(data) => {
+            if let Some(text) = extract_text_from_keyed_archive(data) {
+                out.push(text);
+            }
+        }
+        Value::Dict(entries) => {
+            for (_, v) in entries {
+                collect_text_payloads(v, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_text_payloads(item, out);
+            }
+        }
+        Value::Str(text) => {
+            if !text.is_empty() {
+                out.push(text.clone());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_text_input(content: &Value) -> Option<String> {
+    let mut texts = Vec::new();
+    if let Some(raw) = content.get("text").and_then(Value::as_str) {
+        if !raw.is_empty() {
+            texts.push(raw.to_string());
         }
     }
 
-    fn extract_text_from_keyed_archive(data: &[u8]) -> Option<String> {
-        let root = plist::Value::from_reader(Cursor::new(data)).ok()?;
-        let dict = root.as_dictionary()?;
-        let objects = dict.get("$objects")?.as_array()?;
-        let top = dict.get("$top")?.as_dictionary()?;
-        let text_ops = resolve_plist_uid(objects, top.get("textOperations")?)?.as_dictionary()?;
-        let keyboard_output = resolve_plist_uid(objects, text_ops.get("keyboardOutput")?)?.as_dictionary()?;
-        let insertion = resolve_plist_uid(objects, keyboard_output.get("insertionText")?)?.as_string()?;
-        if insertion.is_empty() {
-            None
-        } else {
-            Some(insertion.to_string())
+    if let Some(raw) = content.get("insertionText").and_then(Value::as_str) {
+        if !raw.is_empty() {
+            texts.push(raw.to_string());
         }
     }
 
-    fn collect_text_payloads(value: &Value, out: &mut Vec<String>) {
-        match value {
-            Value::Bytes(data) => {
-                if let Some(text) = extract_text_from_keyed_archive(data) {
-                    out.push(text);
-                }
-            }
-            Value::Dict(entries) => {
-                for (_, v) in entries {
-                    collect_text_payloads(v, out);
-                }
-            }
-            Value::Array(items) => {
-                for item in items {
-                    collect_text_payloads(item, out);
-                }
-            }
-            Value::Str(text) => {
-                if !text.is_empty() {
-                    out.push(text.clone());
-                }
-            }
-            _ => {}
+    if let Some(ti_data) = content.get("_tiD").and_then(Value::as_bytes) {
+        if let Some(text) = extract_text_from_keyed_archive(ti_data) {
+            texts.push(text);
         }
     }
 
-    fn extract_text_input(content: &Value) -> Option<String> {
-        let mut texts = Vec::new();
-        if let Some(raw) = content.get("text").and_then(Value::as_str) {
-            if !raw.is_empty() {
-                texts.push(raw.to_string());
-            }
-        }
-
-        if let Some(raw) = content.get("insertionText").and_then(Value::as_str) {
-            if !raw.is_empty() {
-                texts.push(raw.to_string());
-            }
-        }
-
-        if let Some(ti_data) = content.get("_tiD").and_then(Value::as_bytes) {
-            if let Some(text) = extract_text_from_keyed_archive(ti_data) {
-                texts.push(text);
-            }
-        }
-
-        collect_text_payloads(content, &mut texts);
-        texts.into_iter().find(|s| !s.trim().is_empty())
-    }
+    collect_text_payloads(content, &mut texts);
+    texts.into_iter().find(|s| !s.trim().is_empty())
+}
 
 /// One Companion connection's state machine.
 pub struct CompanionSession {
     writer: SharedWriter,
     delegate: Arc<dyn AtvDelegate>,
     device_name: String,
+    device_id_str: String,
     device_mac: [u8; 6],
+    server_identifier: String,
     pin: u32,
     _mouse_mode: Arc<AtomicBool>,
     trackpad_mode: Arc<AtomicU8>,
@@ -151,13 +160,13 @@ pub struct CompanionSession {
     private_key: [u8; 32],
     signing_key: SigningKey,
     auth_pub: [u8; 32],
-    verify_private: StaticSecret,
-    verify_pub: X25519PublicKey,
     cipher: Option<CompanionCipher>,
     current_identifier: Option<String>,
+    current_request_key: Option<String>,
     srp: SrpServer,
     remote_session_id: u32,
     session_established: Arc<AtomicBool>,
+    pairing_in_progress: Arc<AtomicBool>,
     touch_origin: Option<(f64, f64)>,
     touch_last: Option<(f64, f64)>,
     touch_moved: bool,
@@ -168,13 +177,20 @@ pub struct CompanionSession {
     inspector: Arc<InspectorHub>,
     registry: Arc<Mutex<DeviceRegistry>>,
     active_tracker: Arc<Mutex<ActiveConnectionTracker>>,
+    media_hub: Arc<MediaHub>,
     conn_id: u64,
     peer_ip: String,
     device_id: Option<String>,
     timeout_deadline: Arc<Mutex<Option<tokio::time::Instant>>>,
+    // RTI Keyboard state
+    is_keyboard_active: bool,
+    rti_session_uuid: [u8; 16],
+    current_text: String,
+    current_title: String,
 }
 
 impl CompanionSession {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         writer: SharedWriter,
         delegate: Arc<dyn AtvDelegate>,
@@ -185,14 +201,14 @@ impl CompanionSession {
         inspector: Arc<InspectorHub>,
         registry: Arc<Mutex<DeviceRegistry>>,
         active_tracker: Arc<Mutex<ActiveConnectionTracker>>,
+        media_hub: Arc<MediaHub>,
         conn_id: u64,
         peer_ip: String,
         session_established: Arc<AtomicBool>,
+        pairing_in_progress: Arc<AtomicBool>,
     ) -> Self {
         let signing_key = SigningKey::from_bytes(&identity.private_key);
         let auth_pub = signing_key.verifying_key().to_bytes();
-        let verify_private = StaticSecret::from(identity.private_key);
-        let verify_pub = X25519PublicKey::from(&verify_private);
         let remote_session_id = if let Ok(mut reg) = registry.try_lock() {
             if let Some(sid) = reg.find_session_id(&peer_ip) {
                 sid
@@ -208,7 +224,9 @@ impl CompanionSession {
             writer,
             delegate,
             device_name: identity.name.clone(),
+            device_id_str: identity.device_id.clone(),
             device_mac: identity.mac_bytes,
+            server_identifier: identity.server_identifier.clone(),
             pin,
             _mouse_mode: mouse_mode,
             trackpad_mode,
@@ -216,13 +234,13 @@ impl CompanionSession {
             private_key: identity.private_key,
             signing_key,
             auth_pub,
-            verify_private,
-            verify_pub,
             cipher: None,
             current_identifier: None,
+            current_request_key: None,
             srp: SrpServer::new(pin, &identity.private_key),
             remote_session_id,
             session_established,
+            pairing_in_progress,
             touch_origin: None,
             touch_last: None,
             touch_moved: false,
@@ -233,10 +251,15 @@ impl CompanionSession {
             inspector,
             registry,
             active_tracker,
+            media_hub,
             conn_id,
             peer_ip,
             device_id: None,
             timeout_deadline: Arc::new(Mutex::new(None)),
+            is_keyboard_active: false,
+            rti_session_uuid: rand::random(),
+            current_text: String::new(),
+            current_title: String::new(),
         }
     }
 
@@ -302,6 +325,11 @@ impl CompanionSession {
         ];
         if let Some(identifier) = &self.current_identifier {
             response.push(Value::kv("_i", Value::str(identifier)));
+            if let Some(req_key) = &self.current_request_key {
+                if req_key != "_i" {
+                    response.push(Value::kv(req_key, Value::str(identifier)));
+                }
+            }
         }
         if let Some(xid) = xid {
             response.push(Value::kv("_x", Value::Int(xid)));
@@ -346,7 +374,8 @@ impl CompanionSession {
             )])),
         )
         .await?;
-        self.delegate.on_event(EventKind::Capabilities, "volume,mute,power");
+        self.delegate
+            .on_event(EventKind::Capabilities, "volume,mute,power");
         Ok(())
     }
 
@@ -373,12 +402,62 @@ impl CompanionSession {
         .await
     }
 
-    /// Publish current power state using both known Companion event names.
+    /// Publish current power state using all known Companion event names.
     async fn send_power_state(&mut self, xid: Option<u64>) -> Result<()> {
         let content = Value::dict(vec![Value::kv("state", Value::Int(self.system_status))]);
         self.send_event("SystemStatus", xid, Some(content.clone()))
             .await?;
-        self.send_event("TVSystemStatus", xid, Some(content)).await?;
+        self.send_event("TVSystemStatus", xid, Some(content.clone()))
+            .await?;
+        self.send_event("_tvSysS", xid, Some(content)).await?;
+        Ok(())
+    }
+
+    /// Push current media metadata over Companion Link if a track is active.
+    async fn push_current_now_playing(&mut self) {
+        if self.cipher.is_none() {
+            return;
+        }
+        if let Some(media) = self.media_hub.get().await {
+            if !media.title.is_empty() {
+                let _ = self
+                    .send_event("NowPlayingInfo", None, Some(media.to_opack_value()))
+                    .await;
+            }
+        }
+    }
+
+    /// Push a live media update broadcast to this client.
+    pub async fn handle_media_update(&mut self, media: &MediaInfo) -> Result<()> {
+        if self.cipher.is_some() && !media.title.is_empty() {
+            self.send_event("NowPlayingInfo", None, Some(media.to_opack_value()))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Push an RTI keyboard focus state change (`_tiStarted` / `_tiStopped`) to this client.
+    pub async fn handle_keyboard_focus(&mut self, event: KeyboardFocusEvent) -> Result<()> {
+        self.is_keyboard_active = event.focused;
+        self.current_text = event.text;
+        self.current_title = event.title;
+
+        if self.cipher.is_some() {
+            if event.focused {
+                self.rti_session_uuid = rand::random();
+                let payload = rti::build_rti_focus_payload(
+                    self.rti_session_uuid,
+                    &self.current_text,
+                    &self.current_title,
+                );
+                let content = Value::dict(vec![Value::kv("_tiD", Value::Bytes(payload))]);
+                info!(">> sending _tiStarted (title={})", self.current_title);
+                self.send_event("_tiStarted", None, Some(content)).await?;
+            } else {
+                info!(">> sending _tiStopped");
+                self.send_event("_tiStopped", None, None).await?;
+            }
+        }
         Ok(())
     }
 
@@ -451,6 +530,11 @@ impl CompanionSession {
     }
 
     async fn pair_setup_m1(&mut self) -> Result<()> {
+        // Protect this connection from eviction and pre-auth timeout while user enters PIN
+        self.pairing_in_progress.store(true, Ordering::SeqCst);
+        self.cipher = None;
+        *self.timeout_deadline.lock().await = None;
+
         let tlv_data = tlv::write(&[
             (tags::SEQ_NO, &[0x02]),
             (tags::SALT, self.srp.salt()),
@@ -507,13 +591,25 @@ impl CompanionSession {
         &mut self,
         pairing_data: &std::collections::BTreeMap<u8, Vec<u8>>,
     ) -> Result<()> {
-        let shared = self.srp.session_key()?.to_vec();
+        let shared = match self.srp.session_key() {
+            Ok(k) => k.to_vec(),
+            Err(e) => {
+                warn!("pair_setup_m5 called without valid SRP key ({e}); ignoring duplicate frame");
+                return Ok(());
+            }
+        };
         let session_key = hkdf_expand("Pair-Setup-Encrypt-Salt", "Pair-Setup-Encrypt-Info", &shared);
         let mut chacha = CompanionCipher::new(&session_key, &session_key, 8)?;
         let encrypted = pairing_data
             .get(&tags::ENCRYPTED_DATA)
             .ok_or_else(|| Error::Protocol("missing encrypted data".into()))?;
-        let decrypted = chacha.decrypt(encrypted, None, Some(b"PS-Msg05"))?;
+        let decrypted = match chacha.decrypt(encrypted, None, Some(b"PS-Msg05")) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("pair_setup_m5 decrypt failed ({e}); ignoring duplicate frame");
+                return Ok(());
+            }
+        };
         let client_tlv = tlv::read(&decrypted);
         debug!("paired client: {} TLV entries", client_tlv.len());
 
@@ -535,10 +631,7 @@ impl CompanionSession {
                 Value::str(&uuid::Uuid::new_v4().to_string().to_uppercase()),
             ),
             Value::kv("model", Value::str(DEVICE_MODEL)),
-            Value::kv(
-                "wifiMAC",
-                Value::Bytes(self.device_mac.to_vec()),
-            ),
+            Value::kv("wifiMAC", Value::Bytes(self.device_mac.to_vec())),
             Value::kv("name", Value::str(&self.device_name)),
             Value::kv("mac", Value::Bytes(self.device_mac.to_vec())),
         ]);
@@ -561,7 +654,17 @@ impl CompanionSession {
             )]),
         )
         .await?;
-        info!("pairing complete");
+
+        // Initialize session cipher from SRP shared secret so immediate encrypted
+        // frames (e.g. _systemInfo right after pairing) decrypt without error.
+        self.cipher = Some(CompanionCipher::new(
+            &hkdf_expand("", "ServerEncrypt-main", &shared),
+            &hkdf_expand("", "ClientEncrypt-main", &shared),
+            12,
+        )?);
+
+        info!("pairing complete, session cipher established");
+        self.pairing_in_progress.store(false, Ordering::SeqCst);
         self.delegate.on_event(EventKind::Paired, "");
         self.inspector.emit("paired", "{}");
         // Fresh salt/verifier for the next pairing attempt.
@@ -573,7 +676,9 @@ impl CompanionSession {
         &mut self,
         pairing_data: &std::collections::BTreeMap<u8, Vec<u8>>,
     ) -> Result<()> {
-        let server_pub = self.verify_pub.to_bytes();
+        // Ephemeral per-session X25519 key pair (STS / Perfect Forward Secrecy)
+        let verify_private = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let server_pub = X25519PublicKey::from(&verify_private);
         let client_pub_bytes = pairing_data
             .get(&tags::PUBLIC_KEY)
             .ok_or_else(|| Error::Protocol("missing client public key".into()))?;
@@ -581,9 +686,7 @@ impl CompanionSession {
             .as_slice()
             .try_into()
             .map_err(|_| Error::Protocol("client public key must be 32 bytes".into()))?;
-        let shared = self
-            .verify_private
-            .diffie_hellman(&X25519PublicKey::from(client_pub));
+        let shared = verify_private.diffie_hellman(&X25519PublicKey::from(client_pub));
         let session_key = hkdf_expand(
             "Pair-Verify-Encrypt-Salt",
             "Pair-Verify-Encrypt-Info",
@@ -591,7 +694,7 @@ impl CompanionSession {
         );
 
         let mut info = Vec::with_capacity(32 + self.unique_id.len() + 32);
-        info.extend_from_slice(&server_pub);
+        info.extend_from_slice(server_pub.as_bytes());
         info.extend_from_slice(&self.unique_id);
         info.extend_from_slice(&client_pub);
         let signature = self.signing_key.sign(&info);
@@ -620,7 +723,7 @@ impl CompanionSession {
                 "_pd",
                 Value::Bytes(tlv::write(&[
                     (tags::SEQ_NO, &[0x02]),
-                    (tags::PUBLIC_KEY, &server_pub),
+                    (tags::PUBLIC_KEY, server_pub.as_bytes()),
                     (tags::ENCRYPTED_DATA, &encrypted),
                 ])),
             )]),
@@ -637,38 +740,71 @@ impl CompanionSession {
             )]),
         )
         .await?;
+
+        // Authentication succeeded: clear pre-auth handshake timeout so standby
+        // connections (sharingd) and active remotes remain alive via TCP keepalive.
+        *self.timeout_deadline.lock().await = None;
+
         info!("verification complete, encrypted control channel enabled");
         self.delegate.on_event(EventKind::Verified, "");
         self.inspector.emit("verified", "{}");
 
-        // Kick connections that do not send _sessionStart within 3.0s
-        *self.timeout_deadline.lock().await =
-            Some(tokio::time::Instant::now() + std::time::Duration::from_millis(3000));
-
         Ok(())
+    }
+
+    /// Extract the RPC method identifier and any dynamic request correlation key
+    /// (iOS 17–27 may send `_i`, `model`, or a UUID key mapped to the RPC name).
+    fn extract_identifier_and_key(data: &Value) -> (Option<String>, Option<String>) {
+        if let Some(id) = data.get("_i").and_then(Value::as_str) {
+            let mut corr_key = Some("_i".to_string());
+            if let Some(entries) = data.as_dict() {
+                for (k, v) in entries {
+                    if let (Value::Str(ks), Value::Str(vs)) = (k, v) {
+                        if ks != "_i" && ks != "model" && vs == id {
+                            corr_key = Some(ks.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+            return (Some(id.to_string()), corr_key);
+        }
+
+        if let Some(id) = data.get("model").and_then(Value::as_str) {
+            return (Some(id.to_string()), Some("model".to_string()));
+        }
+
+        if let Some(entries) = data.as_dict() {
+            for (k, v) in entries {
+                if let (Value::Str(ks), Value::Str(vs)) = (k, v) {
+                    if !matches!(ks.as_str(), "_t" | "_x" | "_c" | "_rT") {
+                        return (Some(vs.clone()), Some(ks.clone()));
+                    }
+                }
+            }
+        }
+
+        (None, None)
     }
 
     async fn handle_control(&mut self, data: &Value) -> Result<()> {
         self.delegate
             .on_event(EventKind::ControlMessage, &data.to_string());
-        // iOS 27 sends `_systemInfo` with the identifier in the `model` key
-        // instead of `_i`; accept both so the `_systemInfo` arm below fires.
-        let identifier = data
-            .get("_i")
-            .or_else(|| data.get("model"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
+
+        let (identifier, request_key) = Self::extract_identifier_and_key(data);
         self.current_identifier = identifier.clone();
+        self.current_request_key = request_key;
         let xid = data.get("_x").and_then(Value::as_int);
         let content = data.get("_c").cloned().unwrap_or(Value::dict(vec![]));
-
-        const INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
         match identifier.as_deref() {
             Some("_sessionStart") => {
                 self.session_established.store(true, Ordering::SeqCst);
-                *self.timeout_deadline.lock().await =
-                    Some(tokio::time::Instant::now() + INACTIVITY_TIMEOUT);
+                *self.timeout_deadline.lock().await = None;
+                {
+                    let mut tracker = self.active_tracker.lock().await;
+                    tracker.on_session_established(self.conn_id);
+                }
                 self.inspector.session_started();
                 {
                     let mut reg = self.registry.lock().await;
@@ -685,9 +821,21 @@ impl CompanionSession {
                     .and_then(Value::as_int)
                     .unwrap_or_else(|| rand::random::<u32>() as u64);
                 let remote_sid = self.remote_session_id;
-                self.send_response(xid, Some(Value::dict(vec![Value::kv("_sid", Value::Int(remote_sid as u64))])), 0)
-                    .await?;
-                info!("<< _sessionStart: session established (local_sid={local_sid}, remote_sid={remote_sid})");
+                self.send_response(
+                    xid,
+                    Some(Value::dict(vec![Value::kv(
+                        "_sid",
+                        Value::Int(remote_sid as u64),
+                    )])),
+                    0,
+                )
+                .await?;
+                let _ = self.send_power_state(None).await;
+                let _ = self.send_media_capabilities(None).await;
+                self.push_current_now_playing().await;
+                info!(
+                    "<< _sessionStart: session established (local_sid={local_sid}, remote_sid={remote_sid})"
+                );
                 self.delegate.on_event(
                     EventKind::SessionStarted,
                     &format!(
@@ -704,8 +852,11 @@ impl CompanionSession {
             }
             Some("TVRCSessionStart") => {
                 self.session_established.store(true, Ordering::SeqCst);
-                *self.timeout_deadline.lock().await =
-                    Some(tokio::time::Instant::now() + INACTIVITY_TIMEOUT);
+                *self.timeout_deadline.lock().await = None;
+                {
+                    let mut tracker = self.active_tracker.lock().await;
+                    tracker.on_session_established(self.conn_id);
+                }
                 self.inspector.session_started();
                 let version = content
                     .get("ProtocolVersionKey")
@@ -721,14 +872,13 @@ impl CompanionSession {
                     0,
                 )
                 .await?;
-                // Current iOS versions make the volume/mute decision
-                // immediately after session startup, so publish the flag
-                // before subscriptions have necessarily arrived.
-                // Do NOT pass xid: this is an unsolicited capability event, not a reply.
+                let _ = self.send_power_state(None).await;
                 self.send_media_capabilities(None).await?;
+                self.push_current_now_playing().await;
                 info!("<< TVRCSessionStart: remote ready (version={version})");
                 self.delegate.on_event(EventKind::RemoteReady, "");
-                self.inspector.emit("remote_ready", &format!("{{\"version\":\"{version}\"}}"));
+                self.inspector
+                    .emit("remote_ready", &format!("{{\"version\":\"{version}\"}}"));
             }
             Some("_sessionStop") => {
                 self.session_established.store(false, Ordering::SeqCst);
@@ -742,34 +892,28 @@ impl CompanionSession {
             }
             Some("_hidC") => {
                 self.session_established.store(true, Ordering::SeqCst);
-                *self.timeout_deadline.lock().await =
-                    Some(tokio::time::Instant::now() + INACTIVITY_TIMEOUT);
                 self.handle_hid_command(&content, xid).await?;
             }
             Some("_touchStart") => {
                 self.session_established.store(true, Ordering::SeqCst);
-                *self.timeout_deadline.lock().await =
-                    Some(tokio::time::Instant::now() + INACTIVITY_TIMEOUT);
                 self.send_response(xid, Some(Value::dict(vec![Value::kv("_i", Value::Int(1))])), 0)
                     .await?;
             }
             Some("_hidT") => {
                 self.session_established.store(true, Ordering::SeqCst);
-                *self.timeout_deadline.lock().await =
-                    Some(tokio::time::Instant::now() + INACTIVITY_TIMEOUT);
                 self.send_response(xid, None, 0).await?;
                 self.handle_touch(&content);
             }
-            Some("_touchStop") | Some("_touchMove") | Some("_tiStop") => {
+            Some("_touchStop") | Some("_touchMove") => {
                 self.session_established.store(true, Ordering::SeqCst);
-                *self.timeout_deadline.lock().await =
-                    Some(tokio::time::Instant::now() + INACTIVITY_TIMEOUT);
+                self.send_response(xid, None, 0).await?;
+            }
+            Some("_tiStop") => {
+                self.session_established.store(true, Ordering::SeqCst);
+                self.is_keyboard_active = false;
                 self.send_response(xid, None, 0).await?;
             }
             Some("_interest") => {
-                // _interest itself is an event and does not need a response.
-                // A real Apple TV pushes the current state for each newly
-                // registered event.
                 if let Some(Value::Array(events)) = content.get("_regEvents") {
                     let names: Vec<String> = events
                         .iter()
@@ -780,7 +924,7 @@ impl CompanionSession {
                             "MediaControlStatus" => {
                                 self.send_event(
                                     &event_name,
-                                    xid,
+                                    None,
                                     Some(Value::dict(vec![Value::kv(
                                         "MediaControlFlags",
                                         Value::Int(MEDIA_CONTROL_VOLUME),
@@ -789,12 +933,18 @@ impl CompanionSession {
                                 .await?;
                             }
                             "NowPlayingInfo" => {
-                                self.send_event(&event_name, xid, None).await?;
+                                let cur = self
+                                    .media_hub
+                                    .get()
+                                    .await
+                                    .filter(|m| !m.title.is_empty())
+                                    .map(|m| m.to_opack_value());
+                                self.send_event(&event_name, None, cur).await?;
                             }
-                            "SystemStatus" | "TVSystemStatus" => {
+                            "SystemStatus" | "TVSystemStatus" | "_tvSysS" => {
                                 self.send_event(
                                     &event_name,
-                                    xid,
+                                    None,
                                     Some(Value::dict(vec![Value::kv(
                                         "state",
                                         Value::Int(self.system_status),
@@ -818,29 +968,75 @@ impl CompanionSession {
                 )
                 .await?;
             }
-            Some("FetchSiriRemoteInfo") | Some("FetchCurrentNowPlayingInfoEvent") => {
+            Some("FetchSiriRemoteInfo") => {
                 self.send_response(xid, None, 0).await?;
+            }
+            Some("FetchCurrentNowPlayingInfoEvent") | Some("FetchNowPlayingInfo") => {
+                let cur = self
+                    .media_hub
+                    .get()
+                    .await
+                    .filter(|m| !m.title.is_empty())
+                    .map(|m| m.to_opack_value());
+                self.send_response(xid, cur.clone(), 0).await?;
+                if let Some(val) = cur {
+                    let _ = self.send_event("NowPlayingInfo", None, Some(val)).await;
+                }
             }
             Some("MediaControlCommand") | Some("_mcc") => {
                 self.handle_media_control(&content, xid).await?;
             }
             Some("_tiStart") => {
-                self.send_response(
-                    xid,
-                    Some(Value::dict(vec![
-                        Value::kv("_tiE", Value::Bool(true)),
-                        Value::kv("_tiV", Value::Int(1)),
-                    ])),
-                    0,
-                )
-                .await?;
+                self.session_established.store(true, Ordering::SeqCst);
+                let mut resp = vec![
+                    Value::kv("_tiE", Value::Bool(true)),
+                    Value::kv("_tiV", Value::Int(1)),
+                ];
+                if self.is_keyboard_active {
+                    let payload = rti::build_rti_focus_payload(
+                        self.rti_session_uuid,
+                        &self.current_text,
+                        &self.current_title,
+                    );
+                    resp.push(Value::kv("_tiD", Value::Bytes(payload)));
+                }
+                self.send_response(xid, Some(Value::Dict(resp)), 0).await?;
             }
             Some("_tiC") | Some("_rtiData") => {
-                if let Some(text) = extract_text_input(&content) {
-                    self.delegate.on_text_input(&text);
+                let mut updated = false;
+                if let Some(ti_data) = content.get("_tiD").and_then(Value::as_bytes) {
+                    if let Some(op) = rti::parse_rti_operation(ti_data) {
+                        match op {
+                            RtiTextOperation::AssertText(s) => {
+                                self.current_text = s;
+                                updated = true;
+                            }
+                            RtiTextOperation::Delta {
+                                deletion_count,
+                                insertion_text,
+                            } => {
+                                for _ in 0..deletion_count {
+                                    self.current_text.pop();
+                                }
+                                if let Some(ins) = insertion_text {
+                                    self.current_text.push_str(&ins);
+                                }
+                                updated = true;
+                            }
+                        }
+                    }
+                }
+                if !updated {
+                    if let Some(text) = extract_text_input(&content) {
+                        self.current_text = text;
+                        updated = true;
+                    }
+                }
+                if updated {
+                    self.delegate.on_text_input(&self.current_text);
                     self.inspector.emit(
                         "text_input",
-                        &format!("{{\"text\":{:?}}}", text),
+                        &format!("{{\"text\":{:?}}}", self.current_text),
                     );
                 }
                 if xid.is_some() {
@@ -910,21 +1106,43 @@ impl CompanionSession {
                     tracker.set_device_id(self.conn_id, primary_id);
                 }
 
-                self.send_response(xid, None, 0).await?;
-                info!("<< _systemInfo: replied and refreshed power state (session_id={session_id}, renewed={is_renewed})");
-                self.send_power_state(None).await?;
+                // Full Apple TV system identity payload required by iOS tvremoted
+                // to bind the Companion session and exit "Connecting..." immediately.
+                let mut resp_c = vec![
+                    Value::kv("name", Value::str(&self.device_name)),
+                    Value::kv("model", Value::str(DEVICE_MODEL)),
+                    Value::kv("_pubID", Value::str(&self.device_id_str)),
+                    Value::kv("_idsID", Value::str(&self.server_identifier)),
+                    Value::kv("_mrID", Value::str(&self.server_identifier)),
+                    Value::kv("_mRtID", Value::str(&self.server_identifier)),
+                    Value::kv("_sv", Value::str(SOURCE_VERSION)),
+                    Value::kv("_sf", Value::Int(256)),
+                    Value::kv("_bf", Value::Int(0)),
+                    Value::kv("_clFl", Value::Int(128)),
+                    Value::kv("_cf", Value::Int(512)),
+                    Value::kv("_i", Value::str(&self.server_identifier)),
+                ];
+                if let Some(cid) = content.get("_idsCID").and_then(Value::as_str) {
+                    resp_c.push(Value::kv("_idsCID", Value::str(cid)));
+                }
 
-                // Background probes from sharingd/rapportd have high bit set in xid (>= 0x80000000)
-                // and never send _sessionStart. Real remote control (tvremoted) sends _sessionStart
-                // within 10-20ms. If probe, set a short 1.0s timeout to release the channel.
-                let is_background_probe = xid.map_or(false, |x| (x & 0x8000_0000) != 0);
-                let timeout = if is_background_probe {
-                    std::time::Duration::from_millis(1000)
-                } else {
-                    std::time::Duration::from_millis(8000)
-                };
-                *self.timeout_deadline.lock().await =
-                    Some(tokio::time::Instant::now() + timeout);
+                self.send_response(xid, Some(Value::Dict(resp_c)), 0).await?;
+                let _ = self.send_power_state(None).await;
+                let _ = self.send_media_capabilities(None).await;
+                self.push_current_now_playing().await;
+                if self.is_keyboard_active {
+                    self.rti_session_uuid = rand::random();
+                    let payload = rti::build_rti_focus_payload(
+                        self.rti_session_uuid,
+                        &self.current_text,
+                        &self.current_title,
+                    );
+                    let content = Value::dict(vec![Value::kv("_tiD", Value::Bytes(payload))]);
+                    let _ = self.send_event("_tiStarted", None, Some(content)).await;
+                }
+                info!(
+                    "<< _systemInfo: replied with full identity (session_id={session_id}, renewed={is_renewed})"
+                );
             }
             _ => {
                 if let Some(id) = &identifier {
@@ -965,7 +1183,7 @@ impl CompanionSession {
                         "audio_state",
                         &format!("{{\"volume\":{:.3},\"muted\":{}}}", self.volume, self.muted),
                     );
-                    self.push_media_state(xid).await?;
+                    self.push_media_state(None).await?;
                 }
                 "mute" => {
                     self.delegate.on_button(&command_name);
@@ -982,7 +1200,7 @@ impl CompanionSession {
                     );
                     self.send_event(
                         "MediaControlStatus",
-                        xid,
+                        None,
                         Some(Value::dict(vec![
                             Value::kv("MediaControlFlags", Value::Int(MEDIA_CONTROL_VOLUME)),
                             Value::kv("Muted", Value::Bool(self.muted)),
@@ -991,7 +1209,7 @@ impl CompanionSession {
                     .await?;
                     self.send_event(
                         "_iMC",
-                        xid,
+                        None,
                         Some(Value::dict(vec![Value::kv(
                             "_mcF",
                             Value::Int(MEDIA_CONTROL_VOLUME),
@@ -1046,7 +1264,6 @@ impl CompanionSession {
             Some(6) => {
                 if let Some(requested) = content.get("_vol").and_then(Value::as_float) {
                     self.volume = requested.clamp(0.0, 1.0);
-                    // Raising the level from the phone lifts the mute.
                     if self.volume > 0.0 {
                         self.muted = false;
                     }
@@ -1077,7 +1294,6 @@ impl CompanionSession {
         let mode = TrackpadMode::from_u8(mode_u8);
 
         if phase == 1 {
-            // touch began
             if let (Some(x), Some(y)) = (x, y) {
                 self.touch_origin = Some((x, y));
                 self.touch_last = Some((x, y));
@@ -1085,7 +1301,8 @@ impl CompanionSession {
                 if mode == TrackpadMode::Mouse {
                     self.delegate.on_touch(0.0, 0.0, TouchPhase::Began);
                 }
-                self.inspector.emit("touch", "{\"phase\":1,\"dx\":0.0,\"dy\":0.0}");
+                self.inspector
+                    .emit("touch", "{\"phase\":1,\"dx\":0.0,\"dy\":0.0}");
             }
             return;
         }
@@ -1095,7 +1312,6 @@ impl CompanionSession {
         let position = (x, y);
 
         if phase != 4 {
-            // intermediate move
             if let Some(last) = self.touch_last {
                 let dx = position.0 - last.0;
                 let dy = position.1 - last.1;
@@ -1114,7 +1330,6 @@ impl CompanionSession {
             return;
         }
 
-        // phase == 4: finger lifted
         self.touch_origin = None;
         self.touch_last = None;
         let dx = position.0 - origin.0;
@@ -1129,7 +1344,6 @@ impl CompanionSession {
             &format!("{{\"phase\":4,\"dx\":{:.1},\"dy\":{:.1}}}", dx, dy),
         );
 
-        // In Idle mode: only emit touch trajectory for real-time preview, do not trigger any actions
         if mode == TrackpadMode::Idle {
             return;
         }
@@ -1163,10 +1377,8 @@ impl CompanionSession {
             "up"
         };
         self.delegate.on_button(direction);
-        self.inspector.emit(
-            "button",
-            &format!("{{\"name\":\"{direction}\"}}"),
-        );
+        self.inspector
+            .emit("button", &format!("{{\"name\":\"{direction}\"}}"));
     }
 }
 

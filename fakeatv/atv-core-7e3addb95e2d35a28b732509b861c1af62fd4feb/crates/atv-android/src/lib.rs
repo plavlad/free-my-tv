@@ -364,6 +364,13 @@ pub extern "system" fn Java_com_corvofeng_fakeatv_AtvNative_nativeGetAirplayPort
     _env: JNIEnv,
     _class: JClass,
 ) -> jint {
+    if let Ok(guard) = SERVER_STATE.lock() {
+        if let Some(ref running) = *guard {
+            if let Some(ref server) = running.server {
+                return server.airplay_port() as jint;
+            }
+        }
+    }
     7000
 }
 
@@ -372,6 +379,13 @@ pub extern "system" fn Java_com_corvofeng_fakeatv_AtvNative_nativeGetCompanionPo
     _env: JNIEnv,
     _class: JClass,
 ) -> jint {
+    if let Ok(guard) = SERVER_STATE.lock() {
+        if let Some(ref running) = *guard {
+            if let Some(ref server) = running.server {
+                return server.companion_port() as jint;
+            }
+        }
+    }
     49153
 }
 
@@ -380,14 +394,40 @@ pub extern "system" fn Java_com_corvofeng_fakeatv_AtvNative_nativeReannounceMdns
     _env: JNIEnv,
     _class: JClass,
 ) {
+    if let Ok(guard) = SERVER_STATE.lock() {
+        if let Some(ref running) = *guard {
+            if let Some(ref server) = running.server {
+                server.reannounce_mdns();
+            }
+        }
+    }
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_corvofeng_fakeatv_AtvNative_nativeSetKeyboardFocus(
-    _env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
-    _focused: jboolean,
-    _text: JString,
-    _title: JString,
+    focused: jboolean,
+    text: JString,
+    title: JString,
 ) {
+    let is_focused = focused != JNI_FALSE;
+    let text_str: String = if !text.is_null() {
+        env.get_string(&text).map(|s| s.into()).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let title_str: String = if !title.is_null() {
+        env.get_string(&title).map(|s| s.into()).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    if let Ok(guard) = SERVER_STATE.lock() {
+        if let Some(ref running) = *guard {
+            if let Some(ref server) = running.server {
+                server.set_keyboard_focus(is_focused, text_str, title_str);
+            }
+        }
+    }
 }

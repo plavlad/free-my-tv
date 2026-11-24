@@ -165,13 +165,17 @@ fn pack_inner(data: &Value, objects: &mut Vec<Vec<u8>>) -> Vec<u8> {
         Value::Int(i) => {
             if *i < 0x28 {
                 vec![(*i as u8) + 8]
-            } else if *i <= 0xFF {
+            } else if *i <= 0x7F {
+                // Apple CoreUtils OPACKDecodeBytes treats 0x30/0x31/0x32 as signed
+                // int8/int16/int32. High-bit values must be promoted to the next
+                // wider integer width so iOS rapportd does not decode positive
+                // transaction IDs (e.g. XID >= 0x8000_0000) as negative numbers.
                 vec![0x30, *i as u8]
-            } else if *i <= 0xFFFF {
+            } else if *i <= 0x7FFF {
                 let mut out = vec![0x31];
                 out.extend_from_slice(&(*i as u16).to_le_bytes());
                 out
-            } else if *i <= 0xFFFF_FFFF {
+            } else if *i <= 0x7FFF_FFFF {
                 let mut out = vec![0x32];
                 out.extend_from_slice(&(*i as u32).to_le_bytes());
                 out

@@ -44,6 +44,7 @@ class AtvService : Service(), AtvNative.Callback {
 
     private var multicastLock: WifiManager.MulticastLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     private var currentName: String? = null
     private var currentPin: Int = 1111
@@ -53,6 +54,7 @@ class AtvService : Service(), AtvNative.Callback {
     private var startThread: Thread? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var screenReceiver: BroadcastReceiver? = null
+    private var watchdogTimer: java.util.Timer? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -104,7 +106,9 @@ class AtvService : Service(), AtvNative.Callback {
                 val callback = object : ConnectivityManager.NetworkCallback() {
                     override fun onAvailable(network: Network) {
                         Log.i(TAG, "Network became available on Android TV")
-                        if (!isRunning && !isStopping) {
+                        if (isRunning) {
+                            refreshNetworkState()
+                        } else if (!isStopping) {
                             val name = currentName ?: DeviceInfo.getDeviceName(this@AtvService)
                             startServer(name, currentPin)
                         }
@@ -131,9 +135,14 @@ class AtvService : Service(), AtvNative.Callback {
                         applyMenuBinding(btn)
                         return
                     }
-                    if (!isRunning && !isStopping) {
-                        val name = currentName ?: DeviceInfo.getDeviceName(this@AtvService)
-                        startServer(name, currentPin)
+                    if (action == Intent.ACTION_SCREEN_ON || action == Intent.ACTION_USER_PRESENT) {
+                        if (isRunning) {
+                            Log.i(TAG, "Screen ON / Wakeup: refreshing locks and mDNS")
+                            refreshNetworkState()
+                        } else if (!isStopping) {
+                            val name = currentName ?: DeviceInfo.getDeviceName(this@AtvService)
+                            startServer(name, currentPin)
+                        }
                     }
                 }
             }
@@ -142,7 +151,11 @@ class AtvService : Service(), AtvNative.Callback {
                 addAction(Intent.ACTION_USER_PRESENT)
                 addAction(ACTION_SET_MENU_BINDING)
             }
-            registerReceiver(receiver, filter)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+            } else {
+                registerReceiver(receiver, filter)
+            }
             screenReceiver = receiver
         } catch (e: Exception) {
             Log.w(TAG, "Failed to register screen receiver", e)
@@ -206,6 +219,17 @@ class AtvService : Service(), AtvNative.Callback {
         if (wakeLock == null || !wakeLock!!.isHeld) {
             val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
             wakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "FakeAtv:WakeLock")?.apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }
+
+        // Acquire WifiLock to prevent Wi-Fi chip from entering high-latency power-save mode
+        if (wifiLock == null || !wifiLock!!.isHeld) {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            @Suppress("DEPRECATION")
+            wifiLock = wm?.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "FakeAtv:WifiLock")?.apply {
+                setReferenceCounted(false)
                 acquire()
             }
         }
@@ -230,9 +254,11 @@ class AtvService : Service(), AtvNative.Callback {
                     val started = AtvNative.nativeStartServer(name, pin, deviceId, serverId, localIp!!, this)
                     if (started) {
                         isRunning = true
+                        val companionPort = AtvNative.nativeGetCompanionPort()
                         broadcast("ServerStatus", "running")
-                        Log.i(TAG, "Native server started successfully on attempt $attempts with IP $localIp")
+                        Log.i(TAG, "Native server started successfully on attempt $attempts with IP $localIp (Companion: $companionPort)")
                         AtvMediaManager.init(this@AtvService)
+                        startWatchdog()
                         break
                     } else {
                         Log.w(TAG, "nativeStartServer returned false on attempt $attempts, will retry in 2.5s")
@@ -258,9 +284,49 @@ class AtvService : Service(), AtvNative.Callback {
         }
     }
 
+    private fun startWatchdog() {
+        watchdogTimer?.cancel()
+        watchdogTimer = java.util.Timer("FakeAtvWatchdog", true).apply {
+            scheduleAtFixedRate(object : java.util.TimerTask() {
+                override fun run() {
+                    if (isRunning && !isStopping) {
+                        refreshNetworkState()
+                    }
+                }
+            }, 45_000L, 45_000L)
+        }
+    }
+
+    private fun refreshNetworkState() {
+        try {
+            if (multicastLock == null || !multicastLock!!.isHeld) {
+                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                multicastLock = wm?.createMulticastLock("FakeAtvMulticastLock")?.apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+            }
+            if (wifiLock == null || !wifiLock!!.isHeld) {
+                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                @Suppress("DEPRECATION")
+                wifiLock = wm?.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "FakeAtv:WifiLock")?.apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+            }
+            if (isRunning) {
+                AtvNative.nativeReannounceMdns()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error refreshing network state: ${e.message}")
+        }
+    }
+
     @Synchronized
     private fun stopServer() {
         isStopping = true
+        watchdogTimer?.cancel()
+        watchdogTimer = null
         startThread?.interrupt()
         startThread = null
 
@@ -278,6 +344,16 @@ class AtvService : Service(), AtvNative.Callback {
             Log.w(TAG, "Error releasing multicastLock: $e")
         } finally {
             multicastLock = null
+        }
+
+        try {
+            wifiLock?.let {
+                if (it.isHeld) it.release()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error releasing wifiLock: $e")
+        } finally {
+            wifiLock = null
         }
 
         try {

@@ -19,6 +19,7 @@ pub mod media;
 pub mod mrp;
 pub mod opack;
 pub mod registry;
+pub mod rti;
 pub mod server;
 pub mod session;
 pub mod settings;
@@ -30,7 +31,7 @@ pub use error::{Error, Result};
 pub use identity::DeviceIdentity;
 pub use inspector::InspectorHub;
 pub use media::{MediaHub, MediaInfo};
-pub use server::{AtvConfig, AtvServer};
+pub use server::{AtvConfig, AtvServer, KeyboardFocusEvent};
 pub use settings::{UserSettings, DEFAULT_MOUSE_SPEED};
 
 /// Companion frame types (first byte of the 4-byte frame header).

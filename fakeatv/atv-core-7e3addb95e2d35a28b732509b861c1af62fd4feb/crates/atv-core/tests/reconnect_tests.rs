@@ -318,7 +318,17 @@ async fn test_rapid_reconnect_preempts_old_session() {
         ),
     ]);
     send_encrypted_companion_opack(&mut client2, &mut cipher2, &select_cmd).await;
-    let cmd_resp = recv_encrypted_companion_opack(&mut client2, &mut cipher2).await;
+    let mut cmd_resp = None;
+    for _ in 0..10 {
+        let msg = recv_encrypted_companion_opack(&mut client2, &mut cipher2).await;
+        if msg.get("_t").and_then(Value::as_int) == Some(3)
+            && msg.get("_x").and_then(Value::as_int) == Some(3)
+        {
+            cmd_resp = Some(msg);
+            break;
+        }
+    }
+    let cmd_resp = cmd_resp.expect("response to _hidC select command");
     assert_eq!(
         cmd_resp.get("_rT").and_then(Value::as_int),
         Some(0),
@@ -633,4 +643,257 @@ async fn test_command_processing_responsiveness() {
 
     drop(stream);
     server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// TEST 5: Full _systemInfo Identity + High-Bit XID (Anti-"Connecting..." Hang)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_system_info_full_identity_and_high_bit_xid() {
+    let delegate = Arc::new(TestDelegate::default());
+    let mut config = AtvConfig::default();
+    config.name = "Test ATV SysInfo".to_string();
+    config.ui_port = None;
+    config.ip = Some(Ipv4Addr::LOCALHOST);
+
+    let server = AtvServer::start(config, delegate).await.unwrap();
+    let companion_port = server.companion_port();
+
+    let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, companion_port))
+        .await
+        .unwrap();
+    let (mut cipher, _) = perform_companion_pair_verify(&mut client).await;
+
+    // Send _systemInfo with high-bit XID (0x986e6123), which previously triggered
+    // a 30-second Connecting... hang in iOS rapportd due to signed int32 OPACK tag 0x32.
+    let high_xid = 0x986e_6123u64;
+    let sys_info = Value::dict(vec![
+        Value::kv("_i", Value::str("_systemInfo")),
+        Value::kv("_t", Value::Int(2)),
+        Value::kv("_x", Value::Int(high_xid)),
+        Value::kv(
+            "_c",
+            Value::dict(vec![
+                Value::kv("_idsID", Value::str("TEST-IPHONE-IDS")),
+                Value::kv("name", Value::str("Test iPhone")),
+                Value::kv("model", Value::str("iPhone18,2")),
+            ]),
+        ),
+    ]);
+    send_encrypted_companion_opack(&mut client, &mut cipher, &sys_info).await;
+
+    // Verify raw decrypted OPACK bytes encode XID with 0x33 (64-bit) rather than 0x32 (signed 32-bit)
+    let mut header = [0u8; 4];
+    client.read_exact(&mut header).await.unwrap();
+    let len = u32::from_be_bytes([0, header[1], header[2], header[3]]) as usize;
+    let mut enc = vec![0u8; len];
+    client.read_exact(&mut enc).await.unwrap();
+    let plain = cipher.decrypt(&enc, Some(&header), None).unwrap();
+
+    let mut expected_xid_bytes = vec![0x33];
+    expected_xid_bytes.extend_from_slice(&high_xid.to_le_bytes());
+    assert!(
+        plain
+            .windows(expected_xid_bytes.len())
+            .any(|w| w == expected_xid_bytes.as_slice()),
+        "High-bit XID must be encoded as 0x33 (int64) in OPACK response"
+    );
+
+    let (resp, _) = opack::unpack(&plain).unwrap();
+    assert_eq!(resp.get("_x").and_then(Value::as_int), Some(high_xid));
+    assert_eq!(resp.get("_rT").and_then(Value::as_int), Some(0));
+    let c = resp.get("_c").expect("_c dict in _systemInfo response");
+    assert!(c.get("_idsID").and_then(Value::as_str).is_some());
+    assert!(c.get("_mrID").and_then(Value::as_str).is_some());
+    assert!(c.get("_mRtID").and_then(Value::as_str).is_some());
+    assert_eq!(c.get("name").and_then(Value::as_str), Some("Test ATV SysInfo"));
+    assert_eq!(c.get("model").and_then(Value::as_str), Some("AppleTV14,1"));
+
+    // Verify proactive SystemStatus and MediaControlStatus follow immediately
+    let mut saw_system_status = false;
+    let mut saw_media_control = false;
+    for _ in 0..5 {
+        let evt = recv_encrypted_companion_opack(&mut client, &mut cipher).await;
+        match evt.get("_i").and_then(Value::as_str) {
+            Some("SystemStatus") => saw_system_status = true,
+            Some("MediaControlStatus") => saw_media_control = true,
+            _ => {}
+        }
+    }
+    assert!(saw_system_status, "Server must push SystemStatus after _systemInfo");
+    assert!(
+        saw_media_control,
+        "Server must push MediaControlStatus after _systemInfo"
+    );
+
+    drop(client);
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// TEST 6: Parallel sharingd Probe Does NOT Break Active tvremoted Session
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_background_probe_coexists_with_active_remote() {
+    let delegate = Arc::new(TestDelegate::default());
+    let buttons = delegate.buttons.clone();
+
+    let mut config = AtvConfig::default();
+    config.name = "Test ATV Coexist".to_string();
+    config.ui_port = None;
+    config.ip = Some(Ipv4Addr::LOCALHOST);
+
+    let server = AtvServer::start(config, delegate).await.unwrap();
+    let companion_port = server.companion_port();
+
+    // 1. tvremoted connects and establishes session
+    let mut remote = TcpStream::connect((Ipv4Addr::LOCALHOST, companion_port))
+        .await
+        .unwrap();
+    let (mut remote_cipher, _) = perform_companion_pair_verify(&mut remote).await;
+
+    let tvrc_start = Value::dict(vec![
+        Value::kv("_i", Value::str("TVRCSessionStart")),
+        Value::kv("_t", Value::Int(2)),
+        Value::kv("_x", Value::Int(10)),
+        Value::kv(
+            "_c",
+            Value::dict(vec![Value::kv("ProtocolVersionKey", Value::str("1.2"))]),
+        ),
+    ]);
+    send_encrypted_companion_opack(&mut remote, &mut remote_cipher, &tvrc_start).await;
+    let resp = recv_encrypted_companion_opack(&mut remote, &mut remote_cipher).await;
+    assert_eq!(resp.get("_rT").and_then(Value::as_int), Some(0));
+
+    // 2. sharingd opens a concurrent background probe from the SAME IP
+    let mut probe = TcpStream::connect((Ipv4Addr::LOCALHOST, companion_port))
+        .await
+        .unwrap();
+    let (mut probe_cipher, _) = perform_companion_pair_verify(&mut probe).await;
+    let sys_info = Value::dict(vec![
+        Value::kv("_i", Value::str("_systemInfo")),
+        Value::kv("_t", Value::Int(2)),
+        Value::kv("_x", Value::Int(0x8000_0001)),
+        Value::kv("_c", Value::dict(vec![Value::kv("_idsID", Value::str("SAME-IPHONE"))])),
+    ]);
+    send_encrypted_companion_opack(&mut probe, &mut probe_cipher, &sys_info).await;
+    let probe_resp = recv_encrypted_companion_opack(&mut probe, &mut probe_cipher).await;
+    assert_eq!(probe_resp.get("_rT").and_then(Value::as_int), Some(0));
+
+    // 3. Active tvremoted MUST STILL BE ALIVE and execute buttons immediately
+    let down_cmd = Value::dict(vec![
+        Value::kv("_i", Value::str("_hidC")),
+        Value::kv("_t", Value::Int(2)),
+        Value::kv("_x", Value::Int(11)),
+        Value::kv(
+            "_c",
+            Value::dict(vec![
+                Value::kv("_hidC", Value::Int(2)), // down
+                Value::kv("_hBtS", Value::Int(2)), // release
+            ]),
+        ),
+    ]);
+    send_encrypted_companion_opack(&mut remote, &mut remote_cipher, &down_cmd).await;
+
+    let mut got_ack = false;
+    for _ in 0..10 {
+        let msg = recv_encrypted_companion_opack(&mut remote, &mut remote_cipher).await;
+        if msg.get("_t").and_then(Value::as_int) == Some(3)
+            && msg.get("_x").and_then(Value::as_int) == Some(11)
+        {
+            got_ack = true;
+            break;
+        }
+    }
+    assert!(
+        got_ack,
+        "Active tvremoted session must remain intact after sharingd background probe"
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(buttons.lock().unwrap().contains(&"down".to_string()));
+
+    drop(probe);
+    drop(remote);
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// LIVE HARDWARE PROBE (ignored by default; run with LIVE_ATV_IP=<ip> --ignored)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn test_live_tv_handshake() {
+    let ip: Ipv4Addr = std::env::var("LIVE_ATV_IP")
+        .unwrap_or_else(|_| "192.168.33.128".to_string())
+        .parse()
+        .expect("valid LIVE_ATV_IP");
+
+    for attempt in 1..=5u64 {
+        let t0 = Instant::now();
+        let mut client = TcpStream::connect((ip, 49153)).await.expect("connect to live TV");
+        let (mut cipher, _) = perform_companion_pair_verify(&mut client).await;
+
+        let high_xid = 0x986e_6123u64 + attempt;
+        let sys_info = Value::dict(vec![
+            Value::kv("_i", Value::str("_systemInfo")),
+            Value::kv("_t", Value::Int(2)),
+            Value::kv("_x", Value::Int(high_xid)),
+            Value::kv(
+                "_c",
+                Value::dict(vec![
+                    Value::kv("_idsID", Value::str("LIVE-VERIFY-PROBE")),
+                    Value::kv("name", Value::str("Live Verify")),
+                    Value::kv("model", Value::str("iPhone18,2")),
+                ]),
+            ),
+        ]);
+        send_encrypted_companion_opack(&mut client, &mut cipher, &sys_info).await;
+
+        let resp = recv_encrypted_companion_opack(&mut client, &mut cipher).await;
+        assert_eq!(resp.get("_x").and_then(Value::as_int), Some(high_xid));
+        let c = resp.get("_c").expect("_c in _systemInfo");
+        assert!(c.get("_mrID").and_then(Value::as_str).is_some());
+
+        let rpcs = [
+            (0x8000_0010u64, "TVRCSessionStart"),
+            (0x8000_0011u64, "FetchSiriRemoteInfo"),
+            (0x8000_0012u64, "FetchMediaControlStatus"),
+            (0x8000_0013u64, "_touchStart"),
+            (0x8000_0014u64, "_tiStart"),
+        ];
+        for (xid, name) in rpcs {
+            let pkt = Value::dict(vec![
+                Value::kv("_i", Value::str(name)),
+                Value::kv("_t", Value::Int(2)),
+                Value::kv("_x", Value::Int(xid)),
+                Value::kv("_c", Value::dict(vec![])),
+            ]);
+            send_encrypted_companion_opack(&mut client, &mut cipher, &pkt).await;
+        }
+
+        let mut got = std::collections::HashSet::new();
+        for _ in 0..30 {
+            let msg = recv_encrypted_companion_opack(&mut client, &mut cipher).await;
+            if msg.get("_t").and_then(Value::as_int) == Some(3) {
+                if let Some(x) = msg.get("_x").and_then(Value::as_int) {
+                    if (0x8000_0010..=0x8000_0014).contains(&x) {
+                        got.insert(x);
+                        if got.len() == 5 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(got.len(), 5, "Attempt {attempt}: missing RPC responses");
+        println!(
+            "Live Chromecast attempt {attempt}/5: Pair-Verify + _systemInfo(0x{high_xid:x}) + 5/5 Remote RPCs -> READY in {:?}",
+            t0.elapsed()
+        );
+        drop(client);
+    }
 }

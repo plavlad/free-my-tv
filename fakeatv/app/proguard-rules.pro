@@ -8,6 +8,9 @@
 -keep class com.corvofeng.fakeatv.DeviceInfo** { *; }
 -keep class com.corvofeng.fakeatv.AtvService** { *; }
 -keep class com.corvofeng.fakeatv.AtvAccessibilityService** { *; }
+-keep class com.corvofeng.fakeatv.AtvMediaManager** { *; }
+-keep class com.corvofeng.fakeatv.AtvMediaSessionService** { *; }
+-keep class com.corvofeng.fakeatv.AtvNotificationListenerService** { *; }
 -keep class com.corvofeng.fakeatv.BootReceiver** { *; }
 -keep class com.corvofeng.fakeatv.MainActivity** { *; }
 

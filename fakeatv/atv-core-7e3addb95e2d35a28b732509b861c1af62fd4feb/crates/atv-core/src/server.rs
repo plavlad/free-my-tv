@@ -1,11 +1,15 @@
-//! Server: TCP listeners and Bonjour (mDNS) advertisement.
+//! Server: Dedicated OS TCP acceptors and Bonjour (mDNS) advertisement.
 //!
-//! Ported from `fake_atv.py`'s `main()`: three services with the exact TXT
-//! records iOS expects (`rpFl=0x36782` etc. gate features like the volume
-//! keys), the MRP port answering minimal framing, and the AirPlay port
-//! answering HTTP "OK".
+//! Advertises `_companion-link._tcp.local.` (with `rpFl=0x76fc2` so iOS
+//! enables Touch, Remote, and Companion immediately without hanging on
+//! "Connecting...") and `_mediaremotetv._tcp.local.` (without a fake AirPlay
+//! receiver identity so iOS does not pop up AirPlay errors).
+//!
+//! Uses dedicated blocking OS acceptor threads (`accept4`) instead of
+//! edge-triggered epoll `TcpListener::accept` to completely eliminate accept
+//! queue starvation on Android TV Wi-Fi drivers.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +18,7 @@ use std::time::Duration;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{broadcast, watch, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -33,6 +37,14 @@ pub const MRP_PORT: u16 = 49152;
 pub const COMPANION_PORT: u16 = 49153;
 pub const SOURCE_VERSION: &str = "715.2";
 pub const DEFAULT_DEVICE_NAME: &str = "Mac Remote";
+
+/// Keyboard focus update pushed from Android Accessibility Service to iOS RTI clients.
+#[derive(Debug, Clone)]
+pub struct KeyboardFocusEvent {
+    pub focused: bool,
+    pub text: String,
+    pub title: String,
+}
 
 /// Query the local Mac's computer name via `scutil --get ComputerName`.
 pub fn detect_mac_computer_name() -> Option<String> {
@@ -115,28 +127,34 @@ pub struct AtvServer {
     ui_port: Option<u16>,
     inspector: Arc<InspectorHub>,
     media_hub: Arc<MediaHub>,
+    keyboard_tx: broadcast::Sender<KeyboardFocusEvent>,
+    current_keyboard: Arc<Mutex<Option<KeyboardFocusEvent>>>,
     mouse_mode: Arc<AtomicBool>,
     trackpad_mode: Arc<AtomicU8>,
     delegate: Arc<dyn AtvDelegate>,
+    running: Arc<AtomicBool>,
     shutdown_tx: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
+    acceptor_threads: Vec<(u16, std::thread::JoinHandle<()>)>,
     #[cfg(target_os = "macos")]
     dns_sd_children: Vec<tokio::process::Child>,
     #[cfg(not(target_os = "macos"))]
     mdns: ServiceDaemon,
     #[cfg(not(target_os = "macos"))]
     mdns_fullnames: Vec<String>,
+    #[cfg(not(target_os = "macos"))]
+    mdns_services: Vec<ServiceInfo>,
 }
 
 impl AtvServer {
-    /// Start listeners and advertise the three Bonjour services.
+    /// Start listeners and advertise Bonjour services.
     pub async fn start(config: AtvConfig, delegate: Arc<dyn AtvDelegate>) -> Result<Self> {
         let trackpad_mode = Arc::new(AtomicU8::new(config.trackpad_mode as u8));
         let mouse_mode = Arc::new(AtomicBool::new(config.trackpad_mode.is_mouse()));
         Self::start_with_trackpad_mode(config, delegate, trackpad_mode, mouse_mode).await
     }
 
-    /// Start listeners with a shared atomic mouse_mode boolean for live mode switching (legacy helper).
+    /// Start listeners with a shared atomic mouse_mode boolean for live mode switching.
     pub async fn start_with_mouse_mode(
         config: AtvConfig,
         delegate: Arc<dyn AtvDelegate>,
@@ -173,38 +191,62 @@ impl AtvServer {
             None => detect_local_ip()?,
         };
 
-        let (mrp_listener, mrp_port) = bind_with_fallback(MRP_PORT, "MRP").await?;
-        let (companion_listener, companion_port) =
-            bind_with_fallback(COMPANION_PORT, "Companion").await?;
-        // Port 7000 is normally occupied when macOS AirPlay Receiver is on;
-        // we only need this endpoint for discovery, so let the OS choose.
-        let airplay_listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
-        let airplay_port = airplay_listener.local_addr()?.port();
+        let (mrp_std_listener, mrp_port) = bind_std_with_fallback(MRP_PORT, "MRP")?;
+        let (companion_std_listener, companion_port) =
+            bind_std_with_fallback(COMPANION_PORT, "Companion")?;
+        let (airplay_std_listener, airplay_port) = bind_std_with_fallback(0, "AirPlay")?;
 
         let inspector = InspectorHub::new();
+        let media_hub = MediaHub::new();
+        let (keyboard_tx, _) = broadcast::channel(16);
+        let current_keyboard = Arc::new(Mutex::new(None));
 
+        let running = Arc::new(AtomicBool::new(true));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut tasks = Vec::new();
-        let media_hub = MediaHub::new();
+        let mut acceptor_threads = Vec::new();
+
+        let (mrp_rx, mrp_thread) =
+            spawn_acceptor_thread(mrp_std_listener, "atv-mrp-accept", mrp_port, running.clone());
+        acceptor_threads.push((mrp_port, mrp_thread));
+
+        let (companion_rx, companion_thread) = spawn_acceptor_thread(
+            companion_std_listener,
+            "atv-comp-accept",
+            companion_port,
+            running.clone(),
+        );
+        acceptor_threads.push((companion_port, companion_thread));
+
+        let (airplay_rx, airplay_thread) = spawn_acceptor_thread(
+            airplay_std_listener,
+            "atv-airp-accept",
+            airplay_port,
+            running.clone(),
+        );
+        acceptor_threads.push((airplay_port, airplay_thread));
 
         tasks.push(tokio::spawn(mrp_loop(
-            mrp_listener,
+            mrp_rx,
             identity.clone(),
             delegate.clone(),
             media_hub.clone(),
             shutdown_rx.clone(),
         )));
         tasks.push(tokio::spawn(airplay_loop(
-            airplay_listener,
+            airplay_rx,
             identity.clone(),
             shutdown_rx.clone(),
         )));
         tasks.push(tokio::spawn(companion_loop(
-            companion_listener,
+            companion_rx,
             identity.clone(),
             config.pin,
             delegate.clone(),
             inspector.clone(),
+            media_hub.clone(),
+            keyboard_tx.clone(),
+            current_keyboard.clone(),
             trackpad_mode.clone(),
             mouse_mode.clone(),
             shutdown_rx.clone(),
@@ -233,12 +275,6 @@ impl AtvServer {
         }
 
         let rpha = identity.device_id.replace(':', "").to_uppercase();
-        let _airplay_id = {
-            let mut h = Sha256::new();
-            h.update(b"airplay-identity:");
-            h.update(identity.server_identifier.as_bytes());
-            hex::encode(&h.finalize()[..8]).to_uppercase()
-        };
         let rphn = {
             let mut h = Sha256::new();
             h.update(b"rpHN:");
@@ -257,13 +293,14 @@ impl AtvServer {
             h.update(identity.server_identifier.as_bytes());
             hex::encode(&h.finalize()[..6]).to_uppercase()
         };
-        let pk = {
-            let mut h = Sha256::new();
-            h.update(b"pk:");
-            h.update(identity.server_identifier.as_bytes());
-            hex::encode(&h.finalize()[..16])
-        };
 
+        // NOTE:
+        // 1. `rpFl=0x76fc2` sets bit 18 (Touch), bit 11 (Remote), and bit 6 (Companion).
+        //    Without bit 18/11, iOS TVRCRPCompanionLinkClientWrapper never activates
+        //    RPHIDTouchSession and hangs indefinitely on "Connecting...".
+        // 2. `_mediaremotetv._tcp` intentionally omits `LocalAirPlayReceiverPairingIdentity`
+        //    and we do NOT advertise `_airplay._tcp` so iOS never mistakes Android TV for
+        //    an AirPlay speaker or displays "Unable to Connect with AirPlay again".
         let services: Vec<(&str, u16, Vec<(&str, &str)>)> = vec![
             (
                 "_mediaremotetv._tcp.local.",
@@ -272,7 +309,6 @@ impl AtvServer {
                     ("Name", identity.name.as_str()),
                     ("UniqueIdentifier", identity.unique_id.as_str()),
                     ("SystemBuildVersion", "22K160"),
-                    ("LocalAirPlayReceiverPairingIdentity", identity.server_identifier.as_str()),
                     ("ModelName", "Apple TV"),
                     ("AllowPairing", "YES"),
                 ],
@@ -286,26 +322,10 @@ impl AtvServer {
                     ("rpHN", rphn.as_str()),
                     ("rpVr", SOURCE_VERSION),
                     ("rpMd", DEVICE_MODEL),
-                    ("rpFl", "0x36782"),
+                    ("rpFl", "0x76fc2"),
                     ("rpAD", rpad.as_str()),
                     ("rpHI", rphi.as_str()),
                     ("rpBA", identity.device_id.as_str()),
-                    ("rpmrtid", identity.unique_id.as_str()),
-                ],
-            ),
-            (
-                "_airplay._tcp.local.",
-                airplay_port,
-                vec![
-                    ("deviceid", identity.device_id.as_str()),
-                    ("features", "0x5A7FFFF7,0x1E"),
-                    ("flags", "0x44"),
-                    ("model", DEVICE_MODEL),
-                    ("srcvers", SOURCE_VERSION),
-                    ("vv", "2"),
-                    ("pi", identity.server_identifier.as_str()),
-                    ("pk", pk.as_str()),
-                    ("name", identity.name.as_str()),
                 ],
             ),
         ];
@@ -332,20 +352,25 @@ impl AtvServer {
                 match cmd.spawn() {
                     Ok(child) => {
                         dns_sd_children.push(child);
-                        info!("registered {}.{service_type} on {ip}:{port} (via macOS mDNSResponder)", identity.name);
+                        info!(
+                            "registered {}.{service_type} on {ip}:{port} (via macOS mDNSResponder)",
+                            identity.name
+                        );
                     }
                     Err(e) => {
                         warn!("failed to spawn /usr/bin/dns-sd for {service_type}: {e}");
                     }
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
 
         #[cfg(not(target_os = "macos"))]
         let mdns = ServiceDaemon::new().map_err(|e| Error::Mdns(e.to_string()))?;
         #[cfg(not(target_os = "macos"))]
         let mut mdns_fullnames = Vec::new();
+        #[cfg(not(target_os = "macos"))]
+        let mut mdns_services = Vec::new();
         #[cfg(not(target_os = "macos"))]
         {
             let host_name = format!("{}.local.", identity.name.replace(' ', "-"));
@@ -360,6 +385,7 @@ impl AtvServer {
                 )
                 .map_err(|e| Error::Mdns(e.to_string()))?;
                 mdns_fullnames.push(info.get_fullname().to_string());
+                mdns_services.push(info.clone());
                 mdns.register(info).map_err(|e| Error::Mdns(e.to_string()))?;
                 info!("registered {}.{service_type} on {ip}:{port}", identity.name);
             }
@@ -371,8 +397,7 @@ impl AtvServer {
         info!("Server ID : {}", identity.server_identifier);
         info!("PIN       : {:04}", config.pin);
         info!("MRP       : {ip}:{mrp_port}");
-        info!("Companion : {ip}:{companion_port}");
-        info!("AirPlay   : {ip}:{airplay_port}");
+        info!("Companion : {ip}:{companion_port} (rpFl=0x76fc2)");
         if let Some(port) = actual_ui_port {
             info!("Debug UI  : http://127.0.0.1:{port}");
         }
@@ -387,17 +412,23 @@ impl AtvServer {
             ui_port: actual_ui_port,
             inspector,
             media_hub,
+            keyboard_tx,
+            current_keyboard,
             mouse_mode,
             trackpad_mode,
             delegate,
+            running,
             shutdown_tx,
             tasks,
+            acceptor_threads,
             #[cfg(target_os = "macos")]
             dns_sd_children,
             #[cfg(not(target_os = "macos"))]
             mdns,
             #[cfg(not(target_os = "macos"))]
             mdns_fullnames,
+            #[cfg(not(target_os = "macos"))]
+            mdns_services,
         })
     }
 
@@ -415,6 +446,35 @@ impl AtvServer {
 
     pub async fn update_media_info(&self, info: MediaInfo) {
         self.media_hub.update(info).await;
+    }
+
+    /// Notify connected iOS Companion clients of Android TV text-field focus state.
+    pub fn set_keyboard_focus(&self, focused: bool, text: String, title: String) {
+        let evt = KeyboardFocusEvent {
+            focused,
+            text,
+            title,
+        };
+        let current_kb = self.current_keyboard.clone();
+        let tx = self.keyboard_tx.clone();
+        let evt_clone = evt.clone();
+        if let Ok(mut guard) = current_kb.try_lock() {
+            *guard = Some(evt_clone);
+        }
+        let _ = tx.send(evt);
+    }
+
+    /// Re-announce all Bonjour services via mDNS to refresh router IGMP/multicast caches.
+    pub fn reannounce_mdns(&self) {
+        #[cfg(not(target_os = "macos"))]
+        {
+            debug!("reannouncing mDNS services (gratuitous refresh)");
+            for info in &self.mdns_services {
+                if let Err(e) = self.mdns.register(info.clone()) {
+                    warn!("failed to reannounce mDNS service {}: {e}", info.get_fullname());
+                }
+            }
+        }
     }
 
     /// The LAN address the services advertise.
@@ -456,7 +516,11 @@ impl AtvServer {
         self.delegate.on_trackpad_mode_changed(mode);
         self.inspector.emit(
             "mode_changed",
-            &format!("{{\"mode\":\"{}\",\"mouse_mode\":{}}}", mode.as_str(), mode.is_mouse()),
+            &format!(
+                "{{\"mode\":\"{}\",\"mouse_mode\":{}}}",
+                mode.as_str(),
+                mode.is_mouse()
+            ),
         );
         crate::settings::UserSettings::update_trackpad_mode(mode.as_str());
     }
@@ -481,7 +545,11 @@ impl AtvServer {
     }
 
     pub fn set_mouse_mode(&self, enabled: bool) {
-        self.set_trackpad_mode(if enabled { TrackpadMode::Mouse } else { TrackpadMode::Direction });
+        self.set_trackpad_mode(if enabled {
+            TrackpadMode::Mouse
+        } else {
+            TrackpadMode::Direction
+        });
     }
 
     pub fn toggle_mouse_mode(&self) -> bool {
@@ -489,8 +557,9 @@ impl AtvServer {
         new_mode.is_mouse()
     }
 
-    /// Unregister Bonjour services and stop all listeners.
+    /// Unregister Bonjour services and stop all listeners and acceptor threads cleanly.
     pub async fn stop(self) {
+        self.running.store(false, Ordering::SeqCst);
         let _ = self.shutdown_tx.send(true);
 
         #[cfg(target_os = "macos")]
@@ -516,32 +585,128 @@ impl AtvServer {
         for task in self.tasks {
             let _ = task.await;
         }
+
+        // Wake each blocking OS acceptor thread via a quick loopback connect so join() never hangs
+        for (port, handle) in self.acceptor_threads {
+            let wake_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+            let _ = std::net::TcpStream::connect_timeout(&wake_addr, Duration::from_millis(100));
+            let _ = handle.join();
+        }
     }
 }
 
-/// Bind `preferred`, falling back to an OS-assigned port when it is occupied.
-/// The chosen port is advertised via Bonjour, so iOS finds the service either way.
-async fn bind_with_fallback(preferred: u16, label: &str) -> Result<(TcpListener, u16)> {
-    match TcpListener::bind((Ipv4Addr::UNSPECIFIED, preferred)).await {
-        Ok(listener) => Ok((listener, preferred)),
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
+/// Bind `preferred` as a blocking `std::net::TcpListener` with `SO_REUSEADDR`.
+/// Falls back to an ephemeral port if `preferred` is actively bound by another listener.
+fn bind_std_with_fallback(preferred: u16, label: &str) -> Result<(std::net::TcpListener, u16)> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    let _ = socket.set_reuse_address(true);
+    let _ = socket.set_nonblocking(false);
+
+    let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, preferred);
+    match socket.bind(&socket2::SockAddr::from(addr)) {
+        Ok(_) => {
+            socket.listen(128)?;
+            let listener: std::net::TcpListener = socket.into();
+            let actual_port = listener.local_addr()?.port();
+            info!("{label} bound to port {actual_port} (SO_REUSEADDR active)");
+            Ok((listener, actual_port))
+        }
+        Err(e) => {
+            warn!("{label} port {preferred} bind failed ({e}); falling back to ephemeral port");
+            let fallback_sock = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )?;
+            let _ = fallback_sock.set_reuse_address(true);
+            let _ = fallback_sock.set_nonblocking(false);
+            let fallback_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+            fallback_sock.bind(&socket2::SockAddr::from(fallback_addr))?;
+            fallback_sock.listen(128)?;
+            let listener: std::net::TcpListener = fallback_sock.into();
             let port = listener.local_addr()?.port();
-            warn!(
-                "{label} port {preferred} is already in use ({e}); \
-                 falling back to ephemeral port {port}"
-            );
+            warn!("{label} ephemeral port is {port}");
             Ok((listener, port))
         }
-        Err(e) => Err(e.into()),
     }
 }
 
-/// Return the IPv4 address used to reach the local network (UDP-connect
-/// trick, like `fake_atv.detect_local_ip`).
+/// Configures TCP_NODELAY and SO_KEEPALIVE on an accepted `std::net::TcpStream`.
+fn configure_std_socket(stream: &std::net::TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        warn!("failed to set TCP_NODELAY: {e}");
+    }
+    let sock = socket2::SockRef::from(stream);
+    #[allow(unused_mut)]
+    let mut ka = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(10))
+        .with_interval(Duration::from_secs(3));
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        ka = ka.with_retries(3);
+    }
+    let _ = sock.set_tcp_keepalive(&ka);
+    let _ = sock.set_keepalive(true);
+}
+
+/// Spawns a dedicated blocking OS thread calling `accept()` directly on the kernel socket.
+/// Completely eliminates EPOLLET accept-queue starvation on Android TV Wi-Fi stacks.
+fn spawn_acceptor_thread(
+    listener: std::net::TcpListener,
+    name: &'static str,
+    port: u16,
+    running: Arc<AtomicBool>,
+) -> (
+    tokio::sync::mpsc::Receiver<(std::net::TcpStream, SocketAddr)>,
+    std::thread::JoinHandle<()>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<(std::net::TcpStream, SocketAddr)>(64);
+    let handle = std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            info!("{name} dedicated OS acceptor thread started on port {port}");
+            loop {
+                match listener.accept() {
+                    Ok((std_stream, peer_addr)) => {
+                        if !running.load(Ordering::SeqCst) {
+                            debug!("{name}: server stopped, dropping wake socket");
+                            break;
+                        }
+                        configure_std_socket(&std_stream);
+                        if let Err(e) = std_stream.set_nonblocking(true) {
+                            warn!("{name}: failed to set nonblocking for {peer_addr}: {e}");
+                            continue;
+                        }
+                        if tx.blocking_send((std_stream, peer_addr)).is_err() {
+                            debug!("{name}: channel closed, terminating acceptor thread");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        if !running.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        warn!("{name}: accept error: {e}");
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+            info!("{name} dedicated OS acceptor thread terminated");
+        })
+        .expect("failed to spawn dedicated OS acceptor thread");
+    (rx, handle)
+}
+
+/// Return the IPv4 address used to reach the local network.
 pub fn detect_local_ip() -> Result<Ipv4Addr> {
     let sock = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-    // A UDP connect sends nothing; it asks the kernel which route it would use.
     if let Ok(()) = sock.connect((Ipv4Addr::new(192, 0, 2, 1), 9)) {
         if let Ok(addr) = sock.local_addr() {
             if let std::net::IpAddr::V4(ip) = addr.ip() {
@@ -560,53 +725,54 @@ pub fn detect_local_ip() -> Result<Ipv4Addr> {
             }
         }
     }
-    Err(Error::Protocol("unable to detect local IPv4 address".into()))
+    Err(Error::Protocol(
+        "unable to detect local IPv4 address".into(),
+    ))
 }
 
-/// Configures TCP socket options: enables TCP_NODELAY to avoid latency on small frames,
-/// and enables SO_KEEPALIVE to detect dead/dropped connections cleanly.
-pub(crate) fn configure_socket(stream: &TcpStream) {
-    if let Err(e) = stream.set_nodelay(true) {
-        warn!("failed to set TCP_NODELAY: {e}");
-    }
-    let sock = socket2::SockRef::from(stream);
-    let mut ka = socket2::TcpKeepalive::new();
-    ka = ka.with_time(Duration::from_secs(10));
-    ka = ka.with_interval(Duration::from_secs(3));
-    let _ = sock.set_tcp_keepalive(&ka);
-    let _ = sock.set_keepalive(true);
-}
-
+#[allow(clippy::too_many_arguments)]
 async fn companion_loop(
-    listener: TcpListener,
+    mut rx: tokio::sync::mpsc::Receiver<(std::net::TcpStream, SocketAddr)>,
     identity: DeviceIdentity,
     pin: u32,
     delegate: Arc<dyn AtvDelegate>,
     inspector: Arc<InspectorHub>,
+    media_hub: Arc<MediaHub>,
+    keyboard_tx: broadcast::Sender<KeyboardFocusEvent>,
+    current_keyboard: Arc<Mutex<Option<KeyboardFocusEvent>>>,
     trackpad_mode: Arc<AtomicU8>,
     mouse_mode: Arc<AtomicBool>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let registry = Arc::new(Mutex::new(DeviceRegistry::new(Duration::from_secs(24 * 3600))));
+    let registry = Arc::new(Mutex::new(DeviceRegistry::new(Duration::from_secs(
+        24 * 3600,
+    ))));
     let active_tracker = Arc::new(Mutex::new(ActiveConnectionTracker::new()));
 
     loop {
-        let stream = tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => {
-                    configure_socket(&stream);
-                    stream
-                }
-                Err(e) => {
-                    warn!("companion accept failed: {e}");
-                    continue;
-                }
+        let (std_stream, peer_addr) = tokio::select! {
+            opt = rx.recv() => match opt {
+                Some(pair) => pair,
+                None => break,
             },
             _ = shutdown.changed() => break,
         };
+
+        let stream = match TcpStream::from_std(std_stream) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("companion from_std failed for {peer_addr}: {e}");
+                continue;
+            }
+        };
+
         let identity = identity.clone();
         let delegate = delegate.clone();
         let inspector = inspector.clone();
+        let media_hub = media_hub.clone();
+        let media_rx = media_hub.subscribe();
+        let keyboard_rx = keyboard_tx.subscribe();
+        let current_keyboard = current_keyboard.clone();
         let trackpad_mode = trackpad_mode.clone();
         let mouse_mode = mouse_mode.clone();
         let registry = registry.clone();
@@ -614,19 +780,38 @@ async fn companion_loop(
         let mut client_shutdown = shutdown.clone();
         tokio::spawn(async move {
             tokio::select! {
-                _ = handle_companion(stream, identity, pin, delegate, inspector, trackpad_mode, mouse_mode, registry, active_tracker) => {},
+                _ = handle_companion(
+                    stream,
+                    identity,
+                    pin,
+                    delegate,
+                    inspector,
+                    media_hub,
+                    media_rx,
+                    keyboard_rx,
+                    current_keyboard,
+                    trackpad_mode,
+                    mouse_mode,
+                    registry,
+                    active_tracker,
+                ) => {},
                 _ = client_shutdown.changed() => {},
             }
         });
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_companion(
     stream: TcpStream,
     identity: DeviceIdentity,
     pin: u32,
     delegate: Arc<dyn AtvDelegate>,
     inspector: Arc<InspectorHub>,
+    media_hub: Arc<MediaHub>,
+    mut media_rx: broadcast::Receiver<Arc<MediaInfo>>,
+    mut keyboard_rx: broadcast::Receiver<KeyboardFocusEvent>,
+    current_keyboard: Arc<Mutex<Option<KeyboardFocusEvent>>>,
     trackpad_mode: Arc<AtomicU8>,
     mouse_mode: Arc<AtomicBool>,
     registry: Arc<Mutex<DeviceRegistry>>,
@@ -647,15 +832,20 @@ async fn handle_companion(
     inspector.emit("client_connected", &format!("{{\"peer\":\"{peer}\"}}"));
 
     let session_established = Arc::new(AtomicBool::new(false));
+    let pairing_in_progress = Arc::new(AtomicBool::new(false));
     let (conn_id, mut abort_rx) = {
         let mut tracker = active_tracker.lock().await;
-        tracker.register(peer_ip, session_established.clone())
+        tracker.register(
+            peer_ip,
+            session_established.clone(),
+            pairing_in_progress.clone(),
+        )
     };
 
     let (mut reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
     let mut session = CompanionSession::new(
-        writer,
+        writer.clone(),
         delegate.clone(),
         &identity,
         pin,
@@ -664,17 +854,91 @@ async fn handle_companion(
         inspector.clone(),
         registry,
         active_tracker.clone(),
+        media_hub,
         conn_id,
         peer_ip.to_string(),
         session_established,
+        pairing_in_progress,
     );
+
+    // Pre-auth handshake timeout: drop silent/stalled unauthenticated sockets after 8 seconds.
+    // Cleared immediately once pair_setup_m1 or pair_verify_m3 completes.
     let timeout_deadline = session.timeout_deadline();
-    // Handshake timeout: 8 seconds to establish handshake progress
-    *timeout_deadline.lock().await =
-        Some(tokio::time::Instant::now() + Duration::from_secs(8));
+    *timeout_deadline.lock().await = Some(tokio::time::Instant::now() + Duration::from_secs(8));
+
+    // Seed current keyboard focus state if active
+    if let Some(evt) = current_keyboard.lock().await.clone() {
+        if evt.focused {
+            let _ = session.handle_keyboard_focus(evt).await;
+        }
+    }
+
+    const MAX_FRAME_LENGTH: usize = 2 * 1024 * 1024;
     let mut disconnect_reason = "peer_closed".to_string();
 
-    const MAX_FRAME_LENGTH: usize = 2 * 1024 * 1024; // 2MB protection against malformed frames
+    // Dedicated cancel-safe reader task so concurrent media/keyboard broadcasts
+    // inside `tokio::select!` can never drop partial `read_exact` frame bytes.
+    let (frame_tx, mut frame_rx) =
+        tokio::sync::mpsc::channel::<Result<(FrameType, Vec<u8>, [u8; 4])>>(64);
+    let peer_clone = peer.clone();
+    let writer_for_probe = writer.clone();
+    let reader_task = tokio::spawn(async move {
+        loop {
+            let mut header = [0u8; 4];
+            if let Err(e) = reader.read_exact(&mut header).await {
+                if e.kind() != std::io::ErrorKind::UnexpectedEof {
+                    let _ = frame_tx
+                        .send(Err(Error::Protocol(format!("io:{e}"))))
+                        .await;
+                }
+                break;
+            }
+            let Some(frame_type) = FrameType::from_u8(header[0]) else {
+                // Gracefully reply to stray HTTP/RTSP probes without noisy errors
+                if &header[..3] == b"GET"
+                    || &header[..4] == b"POST"
+                    || &header[..4] == b"OPTI"
+                {
+                    debug!("companion received stray HTTP probe from {peer_clone}");
+                    use tokio::io::AsyncWriteExt;
+                    let _ = writer_for_probe
+                        .lock()
+                        .await
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                } else {
+                    let _ = frame_tx
+                        .send(Err(Error::Protocol(format!(
+                            "unknown frame type {}",
+                            header[0]
+                        ))))
+                        .await;
+                }
+                break;
+            };
+            let length = u32::from_be_bytes([0, header[1], header[2], header[3]]) as usize;
+            if length > MAX_FRAME_LENGTH {
+                let _ = frame_tx
+                    .send(Err(Error::Protocol(format!(
+                        "frame too large ({length} bytes)"
+                    ))))
+                    .await;
+                break;
+            }
+            let mut payload = vec![0u8; length];
+            if let Err(e) = reader.read_exact(&mut payload).await {
+                let _ = frame_tx
+                    .send(Err(Error::Protocol(format!("incomplete_frame:{e}"))))
+                    .await;
+                break;
+            }
+            if frame_tx.send(Ok((frame_type, payload, header))).await.is_err() {
+                break;
+            }
+        }
+    });
 
     loop {
         let deadline = *timeout_deadline.lock().await;
@@ -687,69 +951,58 @@ async fn handle_companion(
             }
         };
 
-        let mut header = [0u8; 4];
         tokio::select! {
-            res = reader.read_exact(&mut header) => {
-                match res {
-                    Ok(_) => {}
-                    Err(e) => {
-                        if e.kind() != std::io::ErrorKind::UnexpectedEof {
+            frame = frame_rx.recv() => {
+                match frame {
+                    Some(Ok((frame_type, payload, header))) => {
+                        debug!("companion frame={:?} length={}", frame_type, payload.len());
+                        if let Err(e) = session.handle_frame(frame_type, &payload, &header).await {
                             disconnect_reason = format!("error:{e}");
+                            warn!("companion error: {e}");
+                            break;
                         }
+                    }
+                    Some(Err(e)) => {
+                        disconnect_reason = format!("error:{e}");
+                        warn!("companion read error from {peer}: {e}");
+                        break;
+                    }
+                    None => {
                         break;
                     }
                 }
             }
+            kb = keyboard_rx.recv() => {
+                if let Ok(evt) = kb {
+                    let _ = session.handle_keyboard_focus(evt).await;
+                }
+            }
+            media = media_rx.recv() => {
+                if let Ok(info) = media {
+                    let _ = session.handle_media_update(&info).await;
+                }
+            }
             _ = abort_rx.changed() => {
                 disconnect_reason = "superseded".to_string();
-                info!("companion connection from {peer} superseded by new connection");
+                info!("companion connection from {peer} superseded by new remote session");
                 break;
             }
             _ = timeout_fut => {
-                if !session.is_established() {
-                    disconnect_reason = "sessionless_timeout".to_string();
-                    info!("companion connection from {peer} timed out without remote session; closing to free channel");
-                } else {
-                    disconnect_reason = "inactivity_timeout".to_string();
-                    info!("companion connection from {peer} timed out due to inactivity; closing connection");
-                }
+                disconnect_reason = "handshake_timeout".to_string();
+                info!("companion connection from {peer} timed out before authentication; closing");
                 break;
             }
         }
-        let Some(frame_type) = FrameType::from_u8(header[0]) else {
-            disconnect_reason = format!("error:unknown frame type {}", header[0]);
-            warn!("unknown frame type {}", header[0]);
-            break;
-        };
-        let length = u32::from_be_bytes([0, header[1], header[2], header[3]]) as usize;
-        if length > MAX_FRAME_LENGTH {
-            disconnect_reason = format!("error:frame too large ({length} bytes)");
-            warn!("companion frame exceeds limit: {length} bytes from {peer}");
-            break;
-        }
-        let mut payload = vec![0u8; length];
-        if let Err(e) = reader.read_exact(&mut payload).await {
-            disconnect_reason = format!("incomplete_frame:{e}");
-            break;
-        }
-        debug!("companion frame={:?} length={length}", frame_type);
-        if let Err(e) = session.handle_frame(frame_type, &payload, &header).await {
-            disconnect_reason = format!("error:{e}");
-            warn!("companion error: {e}");
-            break;
-        }
-        if session.is_established() {
-            *timeout_deadline.lock().await =
-                Some(tokio::time::Instant::now() + Duration::from_secs(60));
-        }
     }
+
+    reader_task.abort();
 
     {
         let mut tracker = active_tracker.lock().await;
         tracker.unregister(conn_id);
     }
 
-    info!("companion client disconnected: {peer}");
+    info!("companion client disconnected: {peer} ({disconnect_reason})");
     inspector.remove_client(&peer);
     delegate.on_event(
         EventKind::ClientDisconnected,
@@ -763,6 +1016,7 @@ async fn handle_companion(
 
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 
+#[allow(clippy::too_many_arguments)]
 async fn ui_loop(
     listener: TcpListener,
     inspector: Arc<InspectorHub>,
@@ -790,7 +1044,15 @@ async fn ui_loop(
         let trackpad_mode = trackpad_mode.clone();
         let mouse_mode = mouse_mode.clone();
         let device_name = device_name.clone();
-        tokio::spawn(handle_ui_client(stream, inspector, delegate, media_hub, trackpad_mode, mouse_mode, device_name));
+        tokio::spawn(handle_ui_client(
+            stream,
+            inspector,
+            delegate,
+            media_hub,
+            trackpad_mode,
+            mouse_mode,
+            device_name,
+        ));
     }
 }
 
@@ -840,7 +1102,8 @@ async fn handle_ui_client(
             let _ = stream.flush().await;
         }
         ("GET", "/debug") | ("GET", "/debug/") | ("GET", "/logs") => {
-            let resp = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:8766/\r\nConnection: close\r\n\r\n";
+            let resp =
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:8766/\r\nConnection: close\r\n\r\n";
             let _ = stream.write_all(resp.as_bytes()).await;
         }
         ("GET", "/events") => {
@@ -907,7 +1170,11 @@ async fn handle_ui_client(
                         delegate.on_trackpad_mode_changed(new_mode);
                         inspector.emit(
                             "mode_changed",
-                            &format!("{{\"mode\":\"{}\",\"mouse_mode\":{}}}", new_mode.as_str(), new_mode.is_mouse()),
+                            &format!(
+                                "{{\"mode\":\"{}\",\"mouse_mode\":{}}}",
+                                new_mode.as_str(),
+                                new_mode.is_mouse()
+                            ),
                         );
                         crate::settings::UserSettings::update_trackpad_mode(new_mode.as_str());
                         let resp = format!(
@@ -946,7 +1213,11 @@ async fn handle_ui_client(
                 delegate.on_trackpad_mode_changed(new_mode);
                 inspector.emit(
                     "mode_changed",
-                    &format!("{{\"mode\":\"{}\",\"mouse_mode\":{}}}", new_mode.as_str(), new_mode.is_mouse()),
+                    &format!(
+                        "{{\"mode\":\"{}\",\"mouse_mode\":{}}}",
+                        new_mode.as_str(),
+                        new_mode.is_mouse()
+                    ),
                 );
                 crate::settings::UserSettings::update_trackpad_mode(new_mode.as_str());
                 let resp = format!(
@@ -968,7 +1239,11 @@ async fn handle_ui_client(
             delegate.on_trackpad_mode_changed(new_mode);
             inspector.emit(
                 "mode_changed",
-                &format!("{{\"mode\":\"{}\",\"mouse_mode\":{}}}", new_mode.as_str(), new_mode.is_mouse()),
+                &format!(
+                    "{{\"mode\":\"{}\",\"mouse_mode\":{}}}",
+                    new_mode.as_str(),
+                    new_mode.is_mouse()
+                ),
             );
             crate::settings::UserSettings::update_trackpad_mode(new_mode.as_str());
             let resp = format!(
@@ -1002,18 +1277,30 @@ async fn handle_ui_client(
                         delegate.on_trackpad_mode_changed(m);
                         inspector.emit(
                             "mode_changed",
-                            &format!("{{\"mode\":\"{}\",\"mouse_mode\":{}}}", m.as_str(), m.is_mouse()),
+                            &format!(
+                                "{{\"mode\":\"{}\",\"mouse_mode\":{}}}",
+                                m.as_str(),
+                                m.is_mouse()
+                            ),
                         );
                     }
                 } else if let Some(new_mouse) = extract_bool_from_json(body, "mouse_mode") {
-                    let m = if new_mouse { TrackpadMode::Mouse } else { TrackpadMode::Direction };
+                    let m = if new_mouse {
+                        TrackpadMode::Mouse
+                    } else {
+                        TrackpadMode::Direction
+                    };
                     cur_mode = m;
                     trackpad_mode.store(m as u8, Ordering::SeqCst);
                     mouse_mode.store(m.is_mouse(), Ordering::SeqCst);
                     delegate.on_trackpad_mode_changed(m);
                     inspector.emit(
                         "mode_changed",
-                        &format!("{{\"mode\":\"{}\",\"mouse_mode\":{}}}", m.as_str(), m.is_mouse()),
+                        &format!(
+                            "{{\"mode\":\"{}\",\"mouse_mode\":{}}}",
+                            m.as_str(),
+                            m.is_mouse()
+                        ),
                     );
                 }
 
@@ -1035,7 +1322,11 @@ async fn handle_ui_client(
                 );
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{{\"status\":\"ok\",\"mode\":\"{}\",\"mouse_mode\":{},\"speed\":{:.2},\"accel\":{},\"verbose_events\":{}}}",
-                    cur_mode.as_str(), cur_mode.is_mouse(), new_speed, new_accel, new_verbose
+                    cur_mode.as_str(),
+                    cur_mode.is_mouse(),
+                    new_speed,
+                    new_accel,
+                    new_verbose
                 );
                 let _ = stream.write_all(resp.as_bytes()).await;
                 return;
@@ -1062,7 +1353,17 @@ async fn handle_ui_client(
             };
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{{\"status\":\"ok\",\"server_online\":true,\"mode\":\"{}\",\"mouse_mode\":{},\"device_name\":\"{}\",\"mouse_speed\":{:.2},\"mouse_accel\":{},\"verbose_events\":{},\"screen_size\":{},\"client_connected\":{},\"client_peer\":{},\"session_ready\":{},\"audio\":{}}}",
-                cur_mode.as_str(), is_mouse, device_name, speed, accel, verbose_events, screen_json, client_conn, peer_json, session_ready, audio_json
+                cur_mode.as_str(),
+                is_mouse,
+                device_name,
+                speed,
+                accel,
+                verbose_events,
+                screen_json,
+                client_conn,
+                peer_json,
+                session_ready,
+                audio_json
             );
             let _ = stream.write_all(resp.as_bytes()).await;
             return;
@@ -1184,25 +1485,26 @@ fn extract_bool_from_json(json: &str, key: &str) -> Option<bool> {
 }
 
 async fn mrp_loop(
-    listener: TcpListener,
+    mut rx: tokio::sync::mpsc::Receiver<(std::net::TcpStream, SocketAddr)>,
     identity: DeviceIdentity,
     delegate: Arc<dyn AtvDelegate>,
     media_hub: Arc<MediaHub>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
-        let stream = tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => {
-                    configure_socket(&stream);
-                    stream
-                }
-                Err(e) => {
-                    warn!("MRP accept failed: {e}");
-                    continue;
-                }
+        let (std_stream, peer_addr) = tokio::select! {
+            opt = rx.recv() => match opt {
+                Some(pair) => pair,
+                None => break,
             },
             _ = shutdown.changed() => break,
+        };
+        let stream = match TcpStream::from_std(std_stream) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("MRP from_std failed for {peer_addr}: {e}");
+                continue;
+            }
         };
         let identity = identity.clone();
         let delegate = delegate.clone();
@@ -1219,20 +1521,24 @@ async fn mrp_loop(
 }
 
 async fn airplay_loop(
-    listener: TcpListener,
+    mut rx: tokio::sync::mpsc::Receiver<(std::net::TcpStream, SocketAddr)>,
     identity: DeviceIdentity,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
-        let stream = tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => stream,
-                Err(e) => {
-                    warn!("AirPlay accept failed: {e}");
-                    continue;
-                }
+        let (std_stream, peer_addr) = tokio::select! {
+            opt = rx.recv() => match opt {
+                Some(pair) => pair,
+                None => break,
             },
             _ = shutdown.changed() => break,
+        };
+        let stream = match TcpStream::from_std(std_stream) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("AirPlay from_std failed for {peer_addr}: {e}");
+                continue;
+            }
         };
         tokio::spawn(handle_airplay(stream, identity.clone()));
     }
@@ -1325,4 +1631,3 @@ fn peer_string(stream: &TcpStream) -> String {
         .map(|a: SocketAddr| a.to_string())
         .unwrap_or_else(|_| "?".into())
 }
-

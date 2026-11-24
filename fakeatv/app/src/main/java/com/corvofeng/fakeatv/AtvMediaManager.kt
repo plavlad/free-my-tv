@@ -11,6 +11,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.Executors
 
 object AtvMediaManager {
     private const val TAG = "AtvMediaManager"
@@ -18,6 +19,14 @@ object AtvMediaManager {
     private var activeController: MediaController? = null
     private var mediaSessionManager: MediaSessionManager? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val mediaExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "AtvMediaPublish").apply { isDaemon = true }
+    }
+
+    @Volatile private var lastPublishedKey: String = ""
+    @Volatile private var lastPublishedAtMs: Long = 0L
+    @Volatile private var cachedArtKey: String = ""
+    @Volatile private var cachedArtBytes: ByteArray? = null
 
     private val controllerCallback = object : MediaController.Callback() {
         override fun onPlaybackStateChanged(state: PlaybackState?) {
@@ -108,35 +117,57 @@ object AtvMediaManager {
         val appName = controller?.packageName
         val appBundleId = controller?.packageName
 
-        var artBytes: ByteArray? = null
-        try {
-            val bitmap = metadata?.getBitmap(MediaMetadata.METADATA_KEY_ART)
-                ?: metadata?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
-            if (bitmap != null) {
-                val stream = ByteArrayOutputStream()
-                bitmap.compress(Bitmap.CompressFormat.JPEG, 85, stream)
-                artBytes = stream.toByteArray()
+        val nowMs = System.currentTimeMillis()
+        val dedupeKey = "$title|$artist|$album|$duration|$isPlaying|$rate"
+        if (dedupeKey == lastPublishedKey && (nowMs - lastPublishedAtMs) < 500L) {
+            return
+        }
+        lastPublishedKey = dedupeKey
+        lastPublishedAtMs = nowMs
+
+        val artKey = "$title|$artist"
+        val bitmap = if (artKey == cachedArtKey && cachedArtBytes != null) {
+            null
+        } else {
+            try {
+                metadata?.getBitmap(MediaMetadata.METADATA_KEY_ART)
+                    ?: metadata?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+            } catch (_: Exception) {
+                null
             }
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to compress artwork: ${e.message}")
         }
 
-        try {
-            AtvNative.nativeUpdateMediaInfo(
-                title,
-                artist,
-                album,
-                appName,
-                appBundleId,
-                duration,
-                elapsed,
-                rate,
-                isPlaying,
-                artBytes
-            )
-            Log.d(TAG, "Published media: title=$title artist=$artist isPlaying=$isPlaying")
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to call nativeUpdateMediaInfo: ${e.message}")
+        mediaExecutor.execute {
+            var artBytes: ByteArray? = if (artKey == cachedArtKey) cachedArtBytes else null
+            if (bitmap != null) {
+                try {
+                    val stream = ByteArrayOutputStream()
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 80, stream)
+                    artBytes = stream.toByteArray()
+                    cachedArtKey = artKey
+                    cachedArtBytes = artBytes
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to compress artwork: ${e.message}")
+                }
+            }
+
+            try {
+                AtvNative.nativeUpdateMediaInfo(
+                    title,
+                    artist,
+                    album,
+                    appName,
+                    appBundleId,
+                    duration,
+                    elapsed,
+                    rate,
+                    isPlaying,
+                    artBytes
+                )
+                Log.d(TAG, "Published media: title=$title artist=$artist isPlaying=$isPlaying")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to call nativeUpdateMediaInfo: ${e.message}")
+            }
         }
     }
 

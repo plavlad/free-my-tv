@@ -1,11 +1,13 @@
 //! Device registry and active session tracking for Apple TV Companion protocol.
 //!
 //! Maintains known devices, their stable `remote_session_id`, and manages
-//! single active connection per device/IP with instant preemption.
+//! concurrent Companion Link connections (such as iOS `sharingd` standby links
+//! alongside an active `tvremoted` session) while preempting stale remote
+//! sessions on reconnect.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -73,7 +75,6 @@ impl DeviceRegistry {
         self.clean_expired();
         let now = Instant::now();
 
-        // Check if primary_id exists, or if primary_id or alias_id is a registered alias
         let target_key = if self.devices.contains_key(primary_id) {
             Some(primary_id.to_string())
         } else if let Some(canonical) = self.aliases.get(primary_id) {
@@ -150,11 +151,17 @@ pub struct ActiveConnection {
     pub peer_ip: IpAddr,
     pub device_id: Option<String>,
     pub session_established: Arc<AtomicBool>,
+    pub pairing_in_progress: Arc<AtomicBool>,
     pub abort_tx: watch::Sender<bool>,
 }
 
-/// Tracks all live companion connections to enforce single active session
-/// and instant preemption.
+/// Tracks live companion connections so that:
+/// - iOS `sharingd`/`rapportd` background probes NEVER kill an established `tvremoted`
+///   remote session or an in-progress PIN pairing flow;
+/// - when a new `tvremoted` remote session establishes (`_sessionStart` / `TVRCSessionStart`),
+///   any stale/half-open prior remote session from the same device or IP is immediately
+///   superseded without delay;
+/// - stale idle standby connections beyond a small cap per IP are trimmed to prevent leaks.
 #[derive(Default)]
 pub struct ActiveConnectionTracker {
     next_id: u64,
@@ -166,21 +173,37 @@ impl ActiveConnectionTracker {
         Self::default()
     }
 
-    /// Registers a new connection. Automatically aborts any prior connections from the
-    /// same IP unconditionally, even if session_established is true, to enforce a single
-    /// active connection per client IP.
+    /// Registers a new incoming connection.
+    /// Does NOT abort active established remote sessions or active PIN pairing connections
+    /// so parallel iOS daemons (`sharingd`, `rapportd`, `tvremoted`) coexist cleanly.
     pub fn register(
         &mut self,
         peer_ip: IpAddr,
         session_established: Arc<AtomicBool>,
+        pairing_in_progress: Arc<AtomicBool>,
     ) -> (u64, watch::Receiver<bool>) {
-        // Abort all previous connections from the same IP
-        for conn in &self.connections {
-            if conn.peer_ip == peer_ip {
-                info!(
-                    "aborting previous connection from {peer_ip} for new incoming connection"
-                );
-                let _ = conn.abort_tx.send(true);
+        // Keep at most 2 unestablished standby connections per IP (e.g. sharingd + rapportd),
+        // evicting only the oldest unestablished non-pairing standby if exceeded.
+        let unestablished_ids: Vec<u64> = self
+            .connections
+            .iter()
+            .filter(|c| {
+                c.peer_ip == peer_ip
+                    && !c.session_established.load(Ordering::SeqCst)
+                    && !c.pairing_in_progress.load(Ordering::SeqCst)
+            })
+            .map(|c| c.id)
+            .collect();
+
+        if unestablished_ids.len() >= 2 {
+            let excess = unestablished_ids.len() - 1;
+            for old_id in unestablished_ids.into_iter().take(excess) {
+                if let Some(conn) = self.connections.iter().find(|c| c.id == old_id) {
+                    info!(
+                        "[TRACKER] trimming excess standby connection {old_id} from {peer_ip}"
+                    );
+                    let _ = conn.abort_tx.send(true);
+                }
             }
         }
 
@@ -192,24 +215,48 @@ impl ActiveConnectionTracker {
             peer_ip,
             device_id: None,
             session_established,
+            pairing_in_progress,
             abort_tx,
         });
 
         (id, abort_rx)
     }
 
-    /// Associates an identified device with a connection. Aborts any other
-    /// connections for the same device.
+    /// Associates an identified device with a connection.
+    /// Does not kill established sessions from other daemons on the same device.
     pub fn set_device_id(&mut self, conn_id: u64, device_id: &str) {
-        for conn in &self.connections {
-            if conn.id != conn_id && conn.device_id.as_deref() == Some(device_id) {
-                info!("[REGISTRY] closing superseded connection for device {device_id}");
-                let _ = conn.abort_tx.send(true);
-            }
-        }
-
         if let Some(conn) = self.connections.iter_mut().find(|c| c.id == conn_id) {
             conn.device_id = Some(device_id.to_string());
+        }
+    }
+
+    /// Called when a connection actually starts a remote control session
+    /// (`_sessionStart` or `TVRCSessionStart`). Immediately supersedes any older
+    /// established remote session from the same device or IP so reconnections take 0ms.
+    pub fn on_session_established(&mut self, conn_id: u64) {
+        let target = self
+            .connections
+            .iter()
+            .find(|c| c.id == conn_id)
+            .map(|c| (c.peer_ip, c.device_id.clone()));
+
+        let Some((peer_ip, device_id)) = target else {
+            return;
+        };
+
+        for conn in &self.connections {
+            if conn.id == conn_id || conn.pairing_in_progress.load(Ordering::SeqCst) {
+                continue;
+            }
+            let same_device = device_id.is_some() && conn.device_id == device_id;
+            let same_ip = conn.peer_ip == peer_ip;
+            if (same_device || same_ip) && conn.session_established.load(Ordering::SeqCst) {
+                info!(
+                    "[TRACKER] superseding previous remote session {} for new session {} ({peer_ip})",
+                    conn.id, conn_id
+                );
+                let _ = conn.abort_tx.send(true);
+            }
         }
     }
 
@@ -223,13 +270,11 @@ impl ActiveConnectionTracker {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
-    use std::sync::atomic::Ordering;
 
     #[test]
     fn test_device_registry_session_renewal_and_aliasing() {
         let mut reg = DeviceRegistry::new(Duration::from_secs(3600));
 
-        // First registration with idsID
         let (sid1, renewed1) = reg.get_or_register(
             "EE5426A1-FB95-4329-83A4-41F2D767DC28",
             Some("18:3E:E4:EE:ED:40"),
@@ -238,7 +283,6 @@ mod tests {
         );
         assert!(!renewed1);
 
-        // Second registration with same idsID and rotating pubID
         let (sid2, renewed2) = reg.get_or_register(
             "EE5426A1-FB95-4329-83A4-41F2D767DC28",
             Some("C3:DA:FA:17:6F:DF"),
@@ -248,72 +292,95 @@ mod tests {
         assert!(renewed2);
         assert_eq!(sid1, sid2, "Session ID must be preserved across reconnections");
 
-        // Third lookup only using the second alias pubID (e.g. if idsID missing)
         let (sid3, renewed3) = reg.get_or_register("C3:DA:FA:17:6F:DF", None, "MP", "iPhone18,1");
         assert!(renewed3);
         assert_eq!(sid1, sid3, "Alias must point to original session ID");
     }
 
     #[test]
-    fn test_active_connection_tracker_preemption() {
+    fn test_background_probe_does_not_abort_established_remote_session() {
         let mut tracker = ActiveConnectionTracker::new();
-        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 101, 206));
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 33, 204));
 
-        let established1 = Arc::new(AtomicBool::new(false));
-        let (id1, abort_rx1) = tracker.register(ip, established1.clone());
-        assert!(!*abort_rx1.borrow());
+        // 1. tvremoted connects and establishes session
+        let est_remote = Arc::new(AtomicBool::new(true));
+        let pair_remote = Arc::new(AtomicBool::new(false));
+        let (id_remote, abort_remote) =
+            tracker.register(ip, est_remote.clone(), pair_remote.clone());
+        tracker.set_device_id(id_remote, "IPHONE-UUID");
+        tracker.on_session_established(id_remote);
 
-        // A second connection from the same IP arrives before session 1 established
-        let established2 = Arc::new(AtomicBool::new(false));
-        let (id2, abort_rx2) = tracker.register(ip, established2.clone());
+        // 2. sharingd opens a background probe from the exact same IP
+        let est_probe = Arc::new(AtomicBool::new(false));
+        let pair_probe = Arc::new(AtomicBool::new(false));
+        let (id_probe, abort_probe) = tracker.register(ip, est_probe, pair_probe);
+        tracker.set_device_id(id_probe, "IPHONE-UUID");
 
-        // Session 1 must be aborted
-        assert!(*abort_rx1.borrow(), "Prior unestablished connection must be aborted");
-        assert!(!*abort_rx2.borrow(), "New connection must not be aborted");
+        // Active remote MUST NOT be killed by sharingd probe!
+        assert!(
+            !*abort_remote.borrow(),
+            "Background probe must NOT abort established tvremoted session"
+        );
+        assert!(!*abort_probe.borrow());
 
-        // Session 2 identifies device
-        tracker.set_device_id(id2, "EE5426A1-FB95-4329-83A4-41F2D767DC28");
-        established2.store(true, Ordering::SeqCst);
+        // 3. New tvremoted reconnects and establishes a new session -> supersedes old tvremoted
+        let est_new = Arc::new(AtomicBool::new(true));
+        let pair_new = Arc::new(AtomicBool::new(false));
+        let (id_new, abort_new) = tracker.register(ip, est_new, pair_new);
+        tracker.set_device_id(id_new, "IPHONE-UUID");
+        tracker.on_session_established(id_new);
 
-        // Later, another connection identifies the same device
-        let ip2 = IpAddr::V4(Ipv4Addr::new(192, 168, 101, 206));
-        let established3 = Arc::new(AtomicBool::new(false));
-        let (id3, _abort_rx3) = tracker.register(ip2, established3);
-        tracker.set_device_id(id3, "EE5426A1-FB95-4329-83A4-41F2D767DC28");
+        assert!(
+            *abort_remote.borrow(),
+            "Old remote session must be superseded when new remote session establishes"
+        );
+        assert!(
+            !*abort_probe.borrow(),
+            "Standby sharingd connection should remain alive for RTI notifications"
+        );
+        assert!(!*abort_new.borrow());
 
-        // Session 2 must now be superseded
-        let mut abort_rx2_mut = abort_rx2;
-        assert!(*abort_rx2_mut.borrow_and_update(), "Superseded session must be aborted");
-
-        tracker.unregister(id1);
-        tracker.unregister(id2);
-        tracker.unregister(id3);
+        tracker.unregister(id_remote);
+        tracker.unregister(id_probe);
+        tracker.unregister(id_new);
         assert_eq!(tracker.connections.len(), 0);
     }
 
     #[test]
-    fn test_active_connection_tracker_preempts_established_session() {
+    fn test_pairing_connection_is_protected_from_eviction() {
         let mut tracker = ActiveConnectionTracker::new();
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 50));
 
-        let established1 = Arc::new(AtomicBool::new(true)); // Already established
-        let (id1, mut abort_rx1) = tracker.register(ip, established1);
-        assert!(!*abort_rx1.borrow());
+        let est1 = Arc::new(AtomicBool::new(false));
+        let pair1 = Arc::new(AtomicBool::new(true)); // PIN pairing in progress
+        let (id1, abort1) = tracker.register(ip, est1, pair1);
 
-        // Reconnection from same IP arrives
-        let established2 = Arc::new(AtomicBool::new(false));
-        let (id2, abort_rx2) = tracker.register(ip, established2);
-
-        // Established session 1 must be aborted immediately upon register
-        assert!(
-            *abort_rx1.borrow_and_update(),
-            "Established connection must be aborted by new incoming connection from same IP"
+        // Multiple background probes arrive while user is typing PIN
+        let (id2, _) = tracker.register(
+            ip,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
         );
-        assert!(!*abort_rx2.borrow(), "New connection must not be aborted");
+        let (id3, _) = tracker.register(
+            ip,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (id4, _) = tracker.register(
+            ip,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        assert!(
+            !*abort1.borrow(),
+            "In-progress PIN pairing must never be aborted by background connections"
+        );
 
         tracker.unregister(id1);
         tracker.unregister(id2);
-        assert_eq!(tracker.connections.len(), 0);
+        tracker.unregister(id3);
+        tracker.unregister(id4);
     }
 
     #[test]

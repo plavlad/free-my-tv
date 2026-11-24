@@ -46,5 +46,5 @@ object AtvNative {
     external fun nativeGetAirplayPort(): Int
     external fun nativeGetCompanionPort(): Int
     external fun nativeReannounceMdns()
-    external fun nativeSetKeyboardFocus(focused: Boolean)
+    external fun nativeSetKeyboardFocus(focused: Boolean, text: String, title: String)
 }

@@ -32,6 +32,10 @@ class AtvAccessibilityService : AccessibilityService() {
     private var pointerY = 540f
     @Volatile
     private var lastEditableNode: AccessibilityNodeInfo? = null
+    @Volatile
+    private var isKeyboardFocused = false
+    @Volatile
+    private var lastNotifiedText = ""
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -73,19 +77,51 @@ class AtvAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        val source = event?.source ?: return
-        val type = event.eventType
-        if ((type == AccessibilityEvent.TYPE_VIEW_FOCUSED ||
-                    type == AccessibilityEvent.TYPE_VIEW_CLICKED ||
-                    type == AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED ||
-                    type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) &&
-            source.isEditable
-        ) {
-            lastEditableNode?.recycle()
-            lastEditableNode = AccessibilityNodeInfo.obtain(source)
-            Log.d(TAG, "Editable node captured for text input")
+        val type = event?.eventType ?: return
+        val source = event.source
+
+        if (source != null) {
+            if ((type == AccessibilityEvent.TYPE_VIEW_FOCUSED ||
+                        type == AccessibilityEvent.TYPE_VIEW_CLICKED ||
+                        type == AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED) &&
+                source.isEditable
+            ) {
+                lastEditableNode?.recycle()
+                lastEditableNode = AccessibilityNodeInfo.obtain(source)
+                val currentText = source.text?.toString() ?: ""
+                val title = source.hintText?.toString()
+                    ?: source.contentDescription?.toString()
+                    ?: "Ввод текста"
+                if (!isKeyboardFocused || currentText != lastNotifiedText) {
+                    isKeyboardFocused = true
+                    lastNotifiedText = currentText
+                    try {
+                        AtvNative.nativeSetKeyboardFocus(true, currentText, title)
+                    } catch (_: Throwable) {}
+                    Log.d(TAG, "Editable node focused for RTI text input (title=$title)")
+                }
+            } else if (type == AccessibilityEvent.TYPE_VIEW_FOCUSED && !source.isEditable) {
+                if (isKeyboardFocused) {
+                    isKeyboardFocused = false
+                    lastNotifiedText = ""
+                    try {
+                        AtvNative.nativeSetKeyboardFocus(false, "", "")
+                    } catch (_: Throwable) {}
+                    Log.d(TAG, "Editable focus lost -> notified RTI _tiStopped")
+                }
+            }
+            source.recycle()
+        } else if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && isKeyboardFocused) {
+            val focusedInput = findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+            if (focusedInput == null || !focusedInput.isEditable) {
+                isKeyboardFocused = false
+                lastNotifiedText = ""
+                try {
+                    AtvNative.nativeSetKeyboardFocus(false, "", "")
+                } catch (_: Throwable) {}
+            }
+            focusedInput?.recycle()
         }
-        source.recycle()
     }
 
     override fun onInterrupt() {
