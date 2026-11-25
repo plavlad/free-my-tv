@@ -295,7 +295,8 @@ impl AtvServer {
         };
 
         // NOTE:
-        // 1. `rpFl=0x76fc2` sets bit 18 (Touch), bit 11 (Remote), and bit 6 (Companion).
+        // 1. `rpFl=0x77fc2` sets bit 18 (Touch), bit 12 (TextInput), bit 11 (Remote),
+        //    bit 10 (HID), bit 8 (MediaControl), and bit 6 (Companion).
         //    Without bit 18/11, iOS TVRCRPCompanionLinkClientWrapper never activates
         //    RPHIDTouchSession and hangs indefinitely on "Connecting...".
         // 2. `_mediaremotetv._tcp` intentionally omits `LocalAirPlayReceiverPairingIdentity`
@@ -322,7 +323,7 @@ impl AtvServer {
                     ("rpHN", rphn.as_str()),
                     ("rpVr", SOURCE_VERSION),
                     ("rpMd", DEVICE_MODEL),
-                    ("rpFl", "0x76fc2"),
+                    ("rpFl", "0x77fc2"),
                     ("rpAD", rpad.as_str()),
                     ("rpHI", rphi.as_str()),
                     ("rpBA", identity.device_id.as_str()),
@@ -397,7 +398,7 @@ impl AtvServer {
         info!("Server ID : {}", identity.server_identifier);
         info!("PIN       : {:04}", config.pin);
         info!("MRP       : {ip}:{mrp_port}");
-        info!("Companion : {ip}:{companion_port} (rpFl=0x76fc2)");
+        info!("Companion : {ip}:{companion_port} (rpFl=0x77fc2)");
         if let Some(port) = actual_ui_port {
             info!("Debug UI  : http://127.0.0.1:{port}");
         }

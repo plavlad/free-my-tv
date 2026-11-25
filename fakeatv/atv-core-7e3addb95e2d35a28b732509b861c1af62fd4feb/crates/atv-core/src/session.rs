@@ -30,6 +30,8 @@ pub const SERVER_IDENTIFIER: &str = "5D797FD3-3538-427E-A47B-A32FC6CF3A6A";
 pub const SERVER_PRIVATE_KEY: [u8; 32] = [0xaa; 32];
 pub const DEVICE_MODEL: &str = "AppleTV14,1";
 pub const MEDIA_CONTROL_VOLUME: u64 = 0x0100;
+/// Full media + playback + skip (±10s) + volume capabilities bitmask for iOS TVRemoteUI.
+pub const MEDIA_CONTROL_ALL: u64 = 0x03ff;
 
 const SWIPE_MIN_DISTANCE: f64 = 150.0; // touchpad units; the surface is 1000x1000
 const TAP_MAX_DISTANCE: f64 = 60.0; // below this a touch sequence counts as a tap
@@ -354,15 +356,15 @@ impl CompanionSession {
         self.send_encrypted_opack(&Value::Dict(event)).await
     }
 
-    /// Advertise volume support using both modern and legacy wire formats.
+    /// Advertise full media playback, skip (±10s), and volume support using both modern and legacy wire formats.
     async fn send_media_capabilities(&mut self, xid: Option<u64>) -> Result<()> {
         self.send_event(
             "MediaControlStatus",
             xid,
-            Some(Value::dict(vec![Value::kv(
-                "MediaControlFlags",
-                Value::Int(MEDIA_CONTROL_VOLUME),
-            )])),
+            Some(Value::dict(vec![
+                Value::kv("MediaControlFlags", Value::Int(MEDIA_CONTROL_ALL)),
+                Value::kv("Muted", Value::Bool(self.muted)),
+            ])),
         )
         .await?;
         self.send_event(
@@ -370,25 +372,25 @@ impl CompanionSession {
             xid,
             Some(Value::dict(vec![Value::kv(
                 "_mcF",
-                Value::Int(MEDIA_CONTROL_VOLUME),
+                Value::Int(MEDIA_CONTROL_ALL),
             )])),
         )
         .await?;
         self.delegate
-            .on_event(EventKind::Capabilities, "volume,mute,power");
+            .on_event(EventKind::Capabilities, "volume,mute,power,playback,skip");
         Ok(())
     }
 
-    /// Re-publish the volume capability flag after a state change so iOS
+    /// Re-publish media/volume capability flags after a state change so iOS
     /// refreshes its volume HUD (it issues GetVolume in response).
     async fn push_media_state(&mut self, xid: Option<u64>) -> Result<()> {
         self.send_event(
             "MediaControlStatus",
             xid,
-            Some(Value::dict(vec![Value::kv(
-                "MediaControlFlags",
-                Value::Int(MEDIA_CONTROL_VOLUME),
-            )])),
+            Some(Value::dict(vec![
+                Value::kv("MediaControlFlags", Value::Int(MEDIA_CONTROL_ALL)),
+                Value::kv("Muted", Value::Bool(self.muted)),
+            ])),
         )
         .await?;
         self.send_event(
@@ -396,7 +398,7 @@ impl CompanionSession {
             xid,
             Some(Value::dict(vec![Value::kv(
                 "_mcF",
-                Value::Int(MEDIA_CONTROL_VOLUME),
+                Value::Int(MEDIA_CONTROL_ALL),
             )])),
         )
         .await
@@ -438,12 +440,17 @@ impl CompanionSession {
 
     /// Push an RTI keyboard focus state change (`_tiStarted` / `_tiStopped`) to this client.
     pub async fn handle_keyboard_focus(&mut self, event: KeyboardFocusEvent) -> Result<()> {
-        self.is_keyboard_active = event.focused;
-        self.current_text = event.text;
-        self.current_title = event.title;
+        if event.focused {
+            // Do not re-emit `_tiStarted` or overwrite `current_text` if the input session
+            // is already active; doing so resets the iPhone keyboard mid-typing.
+            if self.is_keyboard_active {
+                return Ok(());
+            }
+            self.is_keyboard_active = true;
+            self.current_text = event.text;
+            self.current_title = event.title;
 
-        if self.cipher.is_some() {
-            if event.focused {
+            if self.cipher.is_some() {
                 self.rti_session_uuid = rand::random();
                 let payload = rti::build_rti_focus_payload(
                     self.rti_session_uuid,
@@ -453,7 +460,15 @@ impl CompanionSession {
                 let content = Value::dict(vec![Value::kv("_tiD", Value::Bytes(payload))]);
                 info!(">> sending _tiStarted (title={})", self.current_title);
                 self.send_event("_tiStarted", None, Some(content)).await?;
-            } else {
+            }
+        } else {
+            if !self.is_keyboard_active {
+                return Ok(());
+            }
+            self.is_keyboard_active = false;
+            self.current_text.clear();
+            self.current_title.clear();
+            if self.cipher.is_some() {
                 info!(">> sending _tiStopped");
                 self.send_event("_tiStopped", None, None).await?;
             }
@@ -925,10 +940,13 @@ impl CompanionSession {
                                 self.send_event(
                                     &event_name,
                                     None,
-                                    Some(Value::dict(vec![Value::kv(
-                                        "MediaControlFlags",
-                                        Value::Int(MEDIA_CONTROL_VOLUME),
-                                    )])),
+                                    Some(Value::dict(vec![
+                                        Value::kv(
+                                            "MediaControlFlags",
+                                            Value::Int(MEDIA_CONTROL_ALL),
+                                        ),
+                                        Value::kv("Muted", Value::Bool(self.muted)),
+                                    ])),
                                 )
                                 .await?;
                             }
@@ -960,10 +978,10 @@ impl CompanionSession {
             Some("FetchMediaControlStatus") => {
                 self.send_response(
                     xid,
-                    Some(Value::dict(vec![Value::kv(
-                        "MediaControlFlags",
-                        Value::Int(MEDIA_CONTROL_VOLUME),
-                    )])),
+                    Some(Value::dict(vec![
+                        Value::kv("MediaControlFlags", Value::Int(MEDIA_CONTROL_ALL)),
+                        Value::kv("Muted", Value::Bool(self.muted)),
+                    ])),
                     0,
                 )
                 .await?;
@@ -1003,41 +1021,49 @@ impl CompanionSession {
                 self.send_response(xid, Some(Value::Dict(resp)), 0).await?;
             }
             Some("_tiC") | Some("_rtiData") => {
-                let mut updated = false;
+                let mut new_text: Option<String> = None;
+                let mut submit_pressed = false;
                 if let Some(ti_data) = content.get("_tiD").and_then(Value::as_bytes) {
                     if let Some(op) = rti::parse_rti_operation(ti_data) {
                         match op {
                             RtiTextOperation::AssertText(s) => {
-                                self.current_text = s;
-                                updated = true;
+                                new_text = Some(s);
                             }
                             RtiTextOperation::Delta {
                                 deletion_count,
                                 insertion_text,
                             } => {
+                                let mut candidate = self.current_text.clone();
                                 for _ in 0..deletion_count {
-                                    self.current_text.pop();
+                                    candidate.pop();
                                 }
                                 if let Some(ins) = insertion_text {
-                                    self.current_text.push_str(&ins);
+                                    candidate.push_str(&ins);
                                 }
-                                updated = true;
+                                new_text = Some(candidate);
+                            }
+                            RtiTextOperation::Submit => {
+                                submit_pressed = true;
                             }
                         }
                     }
+                } else if let Some(text) = extract_text_input(&content) {
+                    new_text = Some(text);
                 }
-                if !updated {
-                    if let Some(text) = extract_text_input(&content) {
-                        self.current_text = text;
-                        updated = true;
+
+                if submit_pressed {
+                    info!("<< _tiC Return/Search pressed -> dispatching enter");
+                    self.delegate.on_button("enter");
+                    self.inspector.emit("button", "{\"name\":\"enter\"}");
+                } else if let Some(candidate) = new_text {
+                    if candidate != self.current_text {
+                        self.current_text = candidate;
+                        self.delegate.on_text_input(&self.current_text);
+                        self.inspector.emit(
+                            "text_input",
+                            &format!("{{\"text\":{:?}}}", self.current_text),
+                        );
                     }
-                }
-                if updated {
-                    self.delegate.on_text_input(&self.current_text);
-                    self.inspector.emit(
-                        "text_input",
-                        &format!("{{\"text\":{:?}}}", self.current_text),
-                    );
                 }
                 if xid.is_some() {
                     self.send_response(xid, None, 0).await?;
@@ -1202,7 +1228,7 @@ impl CompanionSession {
                         "MediaControlStatus",
                         None,
                         Some(Value::dict(vec![
-                            Value::kv("MediaControlFlags", Value::Int(MEDIA_CONTROL_VOLUME)),
+                            Value::kv("MediaControlFlags", Value::Int(MEDIA_CONTROL_ALL)),
                             Value::kv("Muted", Value::Bool(self.muted)),
                         ])),
                     )
@@ -1212,7 +1238,7 @@ impl CompanionSession {
                         None,
                         Some(Value::dict(vec![Value::kv(
                             "_mcF",
-                            Value::Int(MEDIA_CONTROL_VOLUME),
+                            Value::Int(MEDIA_CONTROL_ALL),
                         )])),
                     )
                     .await?;
@@ -1241,13 +1267,57 @@ impl CompanionSession {
         Ok(())
     }
 
+    /// Decode an OPACK skip-seconds value that Apple may pack either as a double
+    /// (`-10.0` / `10.0`) or as a signed 1/2/4/8-byte integer.
+    fn decode_signed_seconds(val: &Value) -> Option<i64> {
+        match val {
+            Value::Double(d) => Some(d.round() as i64),
+            Value::Int(u) => {
+                let u = *u;
+                if (u as i64) < 0 {
+                    Some(u as i64)
+                } else if u > 0x7F && u <= 0xFF {
+                    Some((u as i8) as i64)
+                } else if u > 0x7FFF && u <= 0xFFFF {
+                    Some((u as i16) as i64)
+                } else if u > 0x7FFF_FFFF && u <= 0xFFFF_FFFF {
+                    Some((u as i32) as i64)
+                } else {
+                    Some(u as i64)
+                }
+            }
+            _ => None,
+        }
+    }
+
     async fn handle_media_control(&mut self, content: &Value, xid: Option<u64>) -> Result<()> {
         let command = content
             .get("MediaControlCommand")
             .or_else(|| content.get("_mcc"))
             .and_then(Value::as_int);
+        info!("<< MediaControlCommand cmd={command:?} content={content}");
         let mut response = Value::dict(vec![]);
         match command {
+            // TogglePlayPause
+            Some(0) => {
+                self.delegate.on_media_command("toggle", 0);
+            }
+            // Play
+            Some(1) => {
+                self.delegate.on_media_command("play", 0);
+            }
+            // Pause
+            Some(2) => {
+                self.delegate.on_media_command("pause", 0);
+            }
+            // NextTrack
+            Some(3) => {
+                self.delegate.on_media_command("next", 0);
+            }
+            // PreviousTrack
+            Some(4) => {
+                self.delegate.on_media_command("prev", 0);
+            }
             // GetVolume: report 0 while muted so the phone's volume HUD shows
             // an empty bar — the only visual mute feedback this protocol has.
             Some(5) => {
@@ -1274,10 +1344,42 @@ impl CompanionSession {
                     );
                 }
             }
+            // SkipBy (±10s skip buttons in iOS Apple TV Remote)
+            Some(7) => {
+                let skip_secs = content
+                    .get("_skpS")
+                    .or_else(|| content.get("_skipSeconds"))
+                    .or_else(|| content.get("SkipSeconds"))
+                    .and_then(Self::decode_signed_seconds)
+                    .unwrap_or(10);
+                self.delegate.on_media_command("skip", skip_secs);
+            }
+            // FastForwardBegin / Seek
+            Some(8) => {
+                if let Some(pos) = content
+                    .get("_position")
+                    .or_else(|| content.get("position"))
+                    .and_then(Value::as_float)
+                {
+                    self.delegate.on_media_command("seek", pos.round() as i64);
+                } else {
+                    self.delegate.on_media_command("skip", 10);
+                }
+            }
+            // FastForwardEnd
+            Some(9) => {}
+            // RewindBegin
+            Some(10) => {
+                self.delegate.on_media_command("skip", -10);
+            }
+            // RewindEnd
+            Some(11) => {}
             // GetCaptionSettings
             Some(12) => {
                 response = Value::dict(vec![Value::kv("_cse", Value::Bool(false))]);
             }
+            // SetCaptionSettings
+            Some(13) => {}
             _ => {}
         }
         self.send_response(xid, Some(response), 0).await

@@ -557,5 +557,45 @@ airplayd <Error>: ### Connect socket error: socket=17, error=61/0x3D ECONNREFUSE
 2. В `crates/atv-core/src/server.rs` из mDNS-записи `_mediaremotetv._tcp.local.` удален параметр `LocalAirPlayReceiverPairingIdentity`.
 3. В результате паразитный маршрут AirPlay полностью исключен из Пункта управления, а ошибка подключения больше не появляется.
 
+---
+
+## 15. Отображение мини-плеера Now Playing и кнопок перемотки (±10 с)
+
+### 15.1. Причина отсутствия нижней панели воспроизведения и кнопок перемотки
+1. **Пустые критические поля в `TVRCNowPlayingInfo` / `TVRCNowPlayingMetadata` (`media.rs`):**
+   * В `build_now_playing_keyed_archive()` поля `identifier`, `playerIdentifier`, `extendedDescription`, `canonicalID` и `genre` передавались как `$null`.
+   * В `TVRemoteUI` метод `-[TVRUINowPlayingController setNowPlayingInfo:]` проверяет `[identifier length]` и при `nil` сразу выходит (`cbz x0`), не обновляя `MiniPlayer`.
+   * В `TVRemoteCore` метод `-[TVRCNowPlayingMetadata isMissingCriticalMetadata]` возвращает `YES` при пустом `extendedDescription`, скрывая панель Now Playing.
+2. **Ограниченный битмаск `MediaControlFlags` (`session.rs`):**
+   * В `MediaControlStatus`, `_iMC` и `FetchMediaControlStatus` передавался только флаг `0x0100` (`MEDIA_CONTROL_VOLUME`), из-за чего `TVRemoteUI` не активировал кнопки `SkipBackward`/`SkipForward` (±10 с), `Play`/`Pause` и переключения треков.
+   * В `handle_media_control` обрабатывались только `GetVolume (5)`, `SetVolume (6)` и `GetCaptionSettings (12)` — команды `TogglePlayPause (0)`, `Play (1)`, `Pause (2)`, `NextTrack (3)`, `PreviousTrack (4)` и `SkipBy (7, _skpS)` не маршрутизировались в `AtvMediaManager`.
+3. **Флаг `rpFl` (`server.rs`):**
+   * Установлен `rpFl=0x77fc2` (добавлен бит 12 `0x1000` `TextInput` к `Touch`, `Remote`, `HID`, `MediaControl`, `TV`, `Companion`).
+4. **Обложка и прогресс (`AtvMediaManager.kt`):**
+   * Добавлена загрузка обложек из `METADATA_KEY_DISPLAY_ICON` / `ART_URI` / `ALBUM_ART_URI` / `DISPLAY_ICON_URI` / `description.iconUri` с центрированным кропом в квадрат 1:1 (`512x512` JPEG, требуемый `TVRUINowPlayingMiniPlayerViewController`), живая интерполяция позиции `elapsed` и обработка команд `skip` (±10 с) и `play_pause`.
+
+---
+
+## 16. Устранение дублирования текста и проблем с очисткой при вводе с клавиатуры iPhone (RTI)
+
+### 16.1. Причины бага при вводе текста
+По логам `AtvService` и `AtvAccessibility` зафиксированы 4 наложившиеся проблемы:
+1. **Двойной пакет `_tiC` на каждое нажатие клавиши в iOS 17–27:**
+   * Пакет №1 (~616–729 байт, **содержит `inputSourceState`**): инкрементальная дельта (`keyboardOutput.insertionText = "р"` или `deletionCount = 1`).
+   * Пакет №2 (~431–466 байт, **без `inputSourceState`**, приходит через 5–25 мс): **полный снимок всего текстового поля** iPhone в `keyboardOutput.insertionText` (например `"Пр"`).
+   * Ранее оба пакета трактовались как `Delta`, из-за чего каждый символ и слово дописывались поверх уже введённых (`П` -> `ПП` -> `ППр` -> `ПППр`).
+2. **Петля обратной связи `_tiStarted` из `AtvAccessibilityService`:**
+   * После каждого `ACTION_SET_TEXT` Android генерировал `TYPE_VIEW_TEXT_SELECTION_CHANGED`, на что `AtvAccessibilityService` повторно вызывал `nativeSetKeyboardFocus(true, ...)`, а `CompanionSession` слал новый `_tiStarted` с новым `rti_session_uuid`, сбрасывая буфер и регистр клавиатуры iPhone посреди слова (`ПППрИВВЕЕтЕт`).
+3. **Подхват подсказки-плейсхолдера (`"Поиск"`):**
+   * У пустого поля SmartTube `source.text` возвращал подсказку `"Поиск"` при `source.isShowingHintText == true`, из-за чего ввод начинался с `"ПоискП"`.
+4. **Запрет очистки поля до пустой строки:**
+   * В `AtvAccessibilityService.setFocusedText` стояла проверка `if (text.isEmpty()) return false`, блокирующая удаление последнего символа по Backspace.
+
+### 16.2. Исправление
+* В `rti.rs`: пакеты `keyboardOutput` без `inputSourceState` (и с `deletionCount == 0`) интерпретируются как `RtiTextOperation::AssertText`, а `"\n"` — как `RtiTextOperation::Submit` (`KEYCODE_ENTER`).
+* В `session.rs`: дублирующие обновления (`candidate == self.current_text`) отфильтровываются; повторный `handle_keyboard_focus(true)` при уже активной сессии не переотправляет `_tiStarted` и не перетирает `current_text`.
+* В `AtvAccessibilityService.kt`: учтён `isShowingHintText` / `hintText`, убран триггер `TYPE_VIEW_TEXT_SELECTION_CHANGED` для уже сфокусированного поля, снят запрет на `text.isEmpty()`.
+
+
 
 

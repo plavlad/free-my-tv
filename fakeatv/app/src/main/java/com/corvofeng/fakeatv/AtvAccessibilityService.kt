@@ -82,23 +82,32 @@ class AtvAccessibilityService : AccessibilityService() {
 
         if (source != null) {
             if ((type == AccessibilityEvent.TYPE_VIEW_FOCUSED ||
-                        type == AccessibilityEvent.TYPE_VIEW_CLICKED ||
-                        type == AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED) &&
+                        type == AccessibilityEvent.TYPE_VIEW_CLICKED) &&
                 source.isEditable
             ) {
                 lastEditableNode?.recycle()
                 lastEditableNode = AccessibilityNodeInfo.obtain(source)
-                val currentText = source.text?.toString() ?: ""
-                val title = source.hintText?.toString()
+                val hint = source.hintText?.toString()
+                val showingHint = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && source.isShowingHintText
+                val rawText = source.text?.toString() ?: ""
+                val currentText = if (showingHint || (!isKeyboardFocused && !hint.isNullOrEmpty() && rawText == hint)) {
+                    ""
+                } else {
+                    rawText
+                }
+                val title = hint
                     ?: source.contentDescription?.toString()
                     ?: "Ввод текста"
-                if (!isKeyboardFocused || currentText != lastNotifiedText) {
+                // Only emit _tiStarted when newly entering focus. Re-emitting on every
+                // TYPE_VIEW_TEXT_SELECTION_CHANGED creates an RTI feedback loop that resets
+                // the iPhone keyboard session and duplicates characters.
+                if (!isKeyboardFocused) {
                     isKeyboardFocused = true
                     lastNotifiedText = currentText
                     try {
                         AtvNative.nativeSetKeyboardFocus(true, currentText, title)
                     } catch (_: Throwable) {}
-                    Log.d(TAG, "Editable node focused for RTI text input (title=$title)")
+                    Log.d(TAG, "Editable node focused for RTI text input (title=$title, initText='$currentText')")
                 }
             } else if (type == AccessibilityEvent.TYPE_VIEW_FOCUSED && !source.isEditable) {
                 if (isKeyboardFocused) {
@@ -137,8 +146,6 @@ class AtvAccessibilityService : AccessibilityService() {
     }
 
     fun setFocusedText(text: String): Boolean {
-        if (text.isEmpty()) return false
-
         val focusedNode = findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
             ?: rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
             ?: lastEditableNode
@@ -157,7 +164,8 @@ class AtvAccessibilityService : AccessibilityService() {
 
         val success = focusedNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)
         if (success) {
-            Log.i(TAG, "Text inserted into focused editable node")
+            lastNotifiedText = text
+            Log.i(TAG, "Text applied to focused editable node (len=${text.length})")
             lastEditableNode?.recycle()
             lastEditableNode = AccessibilityNodeInfo.obtain(focusedNode)
         } else {
